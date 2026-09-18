@@ -1,0 +1,12 @@
+const fs = require('fs');
+const f = 'shaders/bufferA.frag';
+let T = fs.readFileSync(f, 'utf8');
+const bal = (s) => { const o=(s.match(/{/g)||[]).length, c=(s.match(/}/g)||[]).length, p=(s.match(/\(/g)||[]).length, q=(s.match(/\)/g)||[]).length; return {ok:o===c&&p===q}; };
+const must = (c,m) => { if(!c){console.log('ABORT: '+m);process.exit(1);} };
+const re = /col = vec3\(0\.25, clamp\(0\.5 \+ fpTrue \* 0\.5, 0\.0, 1\.0\), clamp\(0\.5 \+ \(nW - 1\.0\) \* 10\.0, 0\.0, 1\.0\)\);/;
+const m = T.match(re);
+must(!!m, 'readout line not matched');
+T = T.replace(m[0], 'col = vec3(0.25, clamp((log(max(abs(fpTrue), 1e-6)) + 6.0) / 12.0, 0.0, 1.0), clamp(0.5 + (nW - 1.0) * 10.0, 0.0, 1.0));');
+const b = bal(T); console.log('balance', JSON.stringify(b));
+must(b.ok, 'unbalanced');
+fs.writeFileSync(f, T); console.log('WROTE');

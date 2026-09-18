@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="theme-color" content="#000000" />
+<title>GARGANTUA-KN &mdash; Kerr&ndash;Newman Black Hole Raytracer</title>
+<meta name="description" content="Real-time Kerr-Newman null-geodesic raytracer: Carter/Hamiltonian integration, graviational lensing, relativistic accretion disk, HDR bloom." />
+<link rel="stylesheet" href="./css/style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<canvas id="gl"></canvas>
+
+<!-- ===================== BOOT / LOADING OVERLAY ===================== -->
+<div id="boot" class="boot">
+  <div class="boot-inner">
+    <div class="boot-title">GARGANTUA&#8209;KN</div>
+    <div class="boot-sub">KERR&ndash;NEWMAN BLACK HOLE RAYTRACER</div>
+    <div class="boot-bar"><div id="boot-fill" class="boot-fill"></div></div>
+    <div id="boot-status" class="boot-status">initialising&hellip;</div>
+    <pre id="boot-log" class="boot-log"></pre>
+    <div class="boot-tip">
+      GPU shader compilation takes 5&ndash;7.5&nbsp;s on first run.<br />
+      The image appears when integration is warm &mdash; no white screen, no fake frame.
+    </div>
+  </div>
+</div>
+
+<!-- ===================== FATAL ERROR ===================== -->
+<div id="fatal" class="fatal hidden">
+  <div class="fatal-box">
+    <h2>RENDER HALTED</h2>
+    <pre id="fatal-msg"></pre>
+    <p class="fatal-hint">Reload the page. If the error mentions shader compilation, your GPU/driver may not support the required float render targets.</p>
+  </div>
+</div>
+
+<!-- ===================== HUD ===================== -->
+<div id="hud" class="hud">
+  <div id="hud-left" class="hud-left">
+    <div class="brand">
+      <span class="brand-main">GARGANTUA&#8209;KN</span>
+      <span class="brand-sub">Kerr&ndash;Newman raytracer &middot; RK4 adaptive geodesic integrator</span>
+    </div>
+    <div id="readout" class="readout"></div>
+    <div id="metrics" class="metrics"></div>
+  </div>
+
+  <div id="hud-right" class="hud-right">
+    <div id="toolbar" class="toolbar"></div>
+    <div id="debug-legend" class="debug-legend"></div>
+  </div>
+
+  <div id="hud-hints" class="hud-hints">
+    <div class="hints-title">操作说明 <span class="dim">[H 隐藏]</span></div>
+    <div class="hints-grid">
+      <span>左键拖拽 / 滚轮</span><span>环绕视角 + 缩放</span>
+      <span>F / 点击画面 / 方向键</span><span>指针锁定 · 6 自由度惯性飞行</span>
+      <span>↑ ↓ ← →</span><span>推进 / 后退 / 左右平移（自动进入飞行）</span>
+      <span>R / F</span><span>飞行时 上升 / 下降</span>
+      <span>Q / E</span><span>左右翻滚</span>
+      <span>Shift / Ctrl</span><span>加速 / 减速</span>
+      <span>空格</span><span>惯性阻尼（清零速度）</span>
+      <span>F1&ndash;F4 / P</span><span>切换相机预设</span>
+      <span>C</span><span>电影镜头循环</span>
+      <span>0&ndash;9</span><span>调试视图</span>
+      <span>[ ]</span><span>画质 降 / 升</span>
+      <span>R<span class="dim">（非飞行时）</span></span><span>按「初始半径 / 倾角」重新取景并对准黑洞</span>
+      <span>Tab</span><span>参数面板</span>
+      <span>M</span><span>氛围音乐</span>
+      <span>S</span><span>保存 PNG 截图</span>
+      <span>Esc</span><span>结束飞行 / 释放指针</span>
+    </div>
+  </div>
+
+  <div id="crosshair" class="crosshair hidden">
+    <div class="ch-h"></div><div class="ch-v"></div><div class="ch-dot"></div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+</div>
+
+<!-- ===================== PARAMETER PANEL ===================== -->
+<aside id="panel" class="panel">
+  <header class="panel-head">
+    <div>
+      <div class="panel-title">PARAMETERS <span id="param-count" class="dim">21</span></div>
+      <div class="panel-sub">M&nbsp;a&nbsp;Q &middot; integrator &middot; disk &middot; sky &middot; post</div>
+    </div>
+    <div class="panel-head-btns">
+      <button id="btn-reset-params" class="btn tiny" type="button">RESET</button>
+      <button id="btn-copy-params" class="btn tiny" type="button">COPY LINK</button>
+      <button id="btn-close-panel" class="btn tiny" type="button">&times;</button>
+    </div>
+  </header>
+  <div id="param-groups" class="param-groups"></div>
+  <footer class="panel-foot">
+    <div id="panel-note" class="panel-note"></div>
+  </footer>
+</aside>
+
+<button id="btn-open-panel" class="btn fab hidden" type="button" title="Parameters (Tab)">&#9776;</button>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>

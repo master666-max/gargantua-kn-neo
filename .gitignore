@@ -1,0 +1,10 @@
+# ---- OS / editor junk ----
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*~
+
+# ---- local scratch ----
+tools/.vp.log
+*.log

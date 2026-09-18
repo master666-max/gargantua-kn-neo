@@ -1,0 +1,15 @@
+const fs = require('fs');
+const f = 'shaders/bufferA.frag';
+let T = fs.readFileSync(f, 'utf8');
+const bal = (s) => { const o=(s.match(/{/g)||[]).length, c=(s.match(/}/g)||[]).length, p=(s.match(/\(/g)||[]).length, q=(s.match(/\)/g)||[]).length; return {ok:o===c&&p===q}; };
+const must = (c,m) => { if(!c){console.log('ABORT: '+m);process.exit(1);} };
+const rep = (a, b, tag) => { const n = T.split(a).length - 1; must(n === 1, tag + ': found ' + n); T = T.split(a).join(b); console.log('ok: ' + tag); };
+const fa = T.indexOf('vec4 knPolToroidal(');
+must(fa > 0, 'knPolToroidal not found');
+T = T.slice(0, fa) + "\n/* general-b epsilon construction: f^mu ~ eps^{mu nu 0 sigma} p_nu u_t b_sigma with u_rho = (u_t,0,0,0).\n   Six terms.  Needed because the screen basis vectors are NOT orthogonal to p\n   (e_alpha . p = L / sqrt(g_phiphi)), so transporting them directly leaves the Gram expansion\n   outside its own span -- which the residual assertion caught immediately at 4.4e-1.  The\n   eps-IMAGE of a basis vector IS orthogonal to p. */\nvec4 knPolFromB(vec4 pCov, vec4 bCov, float r, float th) {\n  mat4 g, gr, gt, gu; knMetricDR(r, th, g, gr, gt, gu);\n  float om = -g[0][3] / max(g[3][3], 1e-12);\n  float nrm = -(g[0][0] + 2.0 * om * g[0][3] + om * om * g[3][3]);\n  float N = 1.0 / sqrt(max(nrm, 1e-12));\n  float ut = g[0][0] * N + g[0][3] * N * om;\n  float s = max(sin(th), 1e-6);\n  float detg = max(g[2][2], 1e-12) * s;\n  float k = ut / max(detg, 1e-12);\n  float pr = pCov.y, pth = pCov.z, pph = pCov.w;\n  float br = bCov.y, bth = bCov.z, bph = bCov.w;\n  vec4 f;\n  f.x = 0.0;\n  f.y = k * (pth * bph - pph * bth);\n  f.z = k * (pph * br - pr * bph);\n  f.w = k * (pr * bth - pth * br);\n  float n2 = dot(f, g * f);\n  return f / sqrt(max(abs(n2), 1e-20));\n}\n" + '\n' + T.slice(fa);
+const oldInit = '        gA = vec4(0.0, 0.0, 0.0, 1.0 / max(sqrt(max(gT[3][3], 1e-12)), 1e-9));\n        gB = vec4(0.0, 0.0, -1.0 / max(sqrt(max(gT[2][2], 1e-12)), 1e-9), 0.0);';
+const newInit = '        vec4 pCovI = vec4(-E, pr, pth, L);\n        vec4 eA = vec4(0.0, 0.0, 0.0, 1.0 / max(sqrt(max(gT[3][3], 1e-12)), 1e-9));\n        vec4 eB = vec4(0.0, 0.0, -1.0 / max(sqrt(max(gT[2][2], 1e-12)), 1e-9), 0.0);\n        gA = knPolFromB(pCovI, gT * eA, r, th);\n        gB = knPolFromB(pCovI, gT * eB, r, th);';
+rep(oldInit, newInit, 'basis via eps-image');
+const b = bal(T); console.log('balance', JSON.stringify(b));
+must(b.ok, 'unbalanced');
+fs.writeFileSync(f, T); console.log('WROTE');

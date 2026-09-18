@@ -1,0 +1,12 @@
+const fs = require('fs');
+const f = 'shaders/bufferA.frag';
+let T = fs.readFileSync(f, 'utf8');
+const bal = (s) => { const o=(s.match(/{/g)||[]).length, c=(s.match(/}/g)||[]).length, p=(s.match(/\(/g)||[]).length, q=(s.match(/\)/g)||[]).length; return {ok:o===c&&p===q}; };
+const must = (c,m) => { if(!c){console.log('ABORT: '+m);process.exit(1);} };
+const rep = (a, b, tag) => { const n = T.split(a).length - 1; must(n === 1, tag + ': found ' + n); T = T.split(a).join(b); console.log('ok: ' + tag); };
+rep('  float gAn = 1.0, gBn = 1.0;', '  float gAn = 1.0, gBn = 1.0;\n  float gAn0 = 1.0;   /* the basis norm right after initialisation, before any transport */', 'state');
+rep('        gB = knPolFromB(pCovI, gT * eB, r, th);', '        gB = knPolFromB(pCovI, gT * eB, r, th);\n        gAn0 = dot(gA, gT * gA);', 'capture at init');
+rep('evpaDbg = vec4(fpE, detG, gAn, gBn);', 'evpaDbg = vec4(fpE, gAn0, gAn, gBn);', 'payload');
+const b = bal(T); console.log('balance', JSON.stringify(b));
+must(b.ok, 'unbalanced');
+fs.writeFileSync(f, T); console.log('WROTE');

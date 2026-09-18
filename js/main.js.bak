@@ -1,0 +1,903 @@
+/* ============================================================================
+   main.js -- bootstrap, frame loop, input routing, quality governor,
+   state-pixel verification, URL screenshot API and context-loss recovery.
+   ========================================================================== */
+import * as THREE from 'three';
+import { loadShaders } from './shaderlib.js';
+import { Pipeline } from './pipeline.js';
+import { CameraRig, PRESETS } from './controls.js';
+import { HUD } from './hud.js';
+import { AdaptiveQuality, QUALITY, QUALITY_ORDER } from './quality.js';
+import { store } from './storage.js';
+import { PARAMS, LEAVES, DEFAULTS, sanitize, derive, decodeParams, encodeParams, lastExtremalClamp } from './params.js';
+import { shadowAim, trace, diskFluxTable, chargePhysicality, equatorialPhotonOrbits } from './kn.js';
+import { VIEWS } from './params.js';
+import { runAll as runPolTest } from './poltest.js';
+import { GpuTimer } from './gputimer.js';
+import { Ambient } from './audio.js';
+
+/* ---- error capture (also consumed by the automated browser check) -------- */
+window.__KN_ERRORS = [];
+window.addEventListener('error', (e) => { window.__KN_ERRORS.push(String(e.message)); });
+window.addEventListener('unhandledrejection', (e) => { window.__KN_ERRORS.push('rejection: ' + String(e.reason)); });
+/* three.js reports shader compile/link failures through console.error, so the
+   console is part of the error surface for this project. */
+(function captureConsole() {
+  const wrap = (fn, tag) => function () {
+    try { window.__KN_ERRORS.push(tag + ': ' + Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
+    return fn.apply(console, arguments);
+  };
+  console.error = wrap(console.error, 'console.error');
+  console.warn = wrap(console.warn, 'console.warn');
+})();
+
+const qs = new URLSearchParams(location.search);
+const SHOT = qs.has('shot');
+const SEED = Number.isFinite(Number(qs.get('seed'))) && Number(qs.get('seed')) > 0 ? Number(qs.get('seed')) : 7.37;
+const canvas = document.getElementById('gl');
+
+const hud = new HUD({
+  onParam: (id, v) => {
+    values[id] = v; values = sanitize(values); refreshDerived(); persist();
+  /* L4: never clamp silently -- if the requested a^2+Q^2 left the black-hole
+     regime, say so. */
+  const cl = lastExtremalClamp;
+  if (cl && Math.abs(cl.k - warnedClampK) > 1e-6) {
+    warnedClampK = cl.k;
+    hud.toast('a\u00b2+Q\u00b2 > M\u00b2 would be a naked singularity: clamped by k = ' +
+      cl.k.toFixed(3) + '  (a\u2192' + cl.clampedA.toFixed(3) + ', Q\u2192' + cl.clampedQ.toFixed(3) + ')', 3600);
+  } else if (!cl) { warnedClampK = null; }
+    /* camera radius / inclination are live controls: re-frame immediately while
+       orbiting, and leave the ship alone while flying. */
+    if ((id === 'camR' || id === 'camTheta') && rig && rig.mode !== 'flight') {
+      const p = rig.applyStartup(values);
+      values.camR = p.r; values.camTheta = p.th * 180 / Math.PI;
+      hud.syncValues(values); refreshDerived();
+      /* re-measure the composition for the new pose, after it has rendered */
+      requestAnimationFrame(() => requestAnimationFrame(() => recentre()));
+    }
+  },
+  onResetParams: () => { values = { ...DEFAULTS }; refreshDerived(); hud.syncValues(values); persist(); hud.toast('PARAMETERS RESET'); },
+  onCopyLink: () => { copyLink(); },
+  onPreset: (i) => applyPreset(i),
+  onCinematic: () => setMode('cinematic'),
+  onMode: (m) => setMode(m),
+  onQuality: (q) => setQuality(q),
+  onMusic: () => toggleMusic(),
+  onScreenshot: () => saveShot(),
+  onToggleHud: () => hud.toggleHud(),
+    onDebug: (n) => setDebug(n),
+    onViewStep: (d) => {
+      const ns = VIEWS.map((v) => v.n);
+      const i = ns.indexOf(debugView);
+      const j = ((i < 0 ? 0 : i) + d + ns.length) % ns.length;
+      setDebug(ns[j]);
+    },
+});
+
+/* ---- parameter state ----------------------------------------------------- */
+let values = (() => {
+  const fromUrl = Object.keys(DEFAULTS).some(k => qs.has(k)) || qs.has('preset') ? decodeParams(location.search) : null;
+  const saved = store.get('params', null);
+  const v = fromUrl || (saved ? sanitize(saved) : { ...DEFAULTS });
+  if (qs.get('preset') !== null) {
+    const p = PRESETS[Math.min(PRESETS.length - 1, Math.max(0, Number(qs.get('preset')) | 0))];
+    v.camR = p.r; v.camTheta = (p.th * 180) / Math.PI;
+    v.initSpeed = Math.abs(p.vel[0]);
+  }
+  return sanitize(v);
+})();
+hud.syncValues(values);
+let derived = derive(values);
+function refreshDerived() {
+  derived = derive(values);
+  /* the rig needs the live M/a/Q: its horizon / ergosphere readout and, more
+     importantly, the shadow-centring pan angle all depend on them.  This was
+     never called, so the aim stayed frozen at the default spin. */
+  if (typeof rig !== 'undefined' && rig) rig.setParams(derived.M, derived.a, derived.Q);
+  refreshFluxNorm();
+}
+
+/* L2: the disk temperature is now the relativistic dissipation law
+   T ~ F^(1/4) with F = (L - L_in)(-dOmega/dr)/(4 pi r).  The shader evaluates
+   that law itself (knFluxTemp in disk.glsl); it only needs the peak that
+   normalises it and L(r_in).  Both come from the same CPU table the validator
+   and the audit harness use, so the two sides cannot disagree. */
+let fluxNorm = { peak: 1, lin: 0 };
+let bCrit = { pro: 0, ret: 0 };
+/* 未解算像素标记：稀疏点阵，可用 U 键开关 */
+/* OFF by default.  It exists to make rays that ran out of step budget visible instead of
+   letting them masquerade as shadow -- but at the new default of 2048 steps there are none
+   left to mark (measured 0.00% against 2.46% at 512), so the honest default is off.  Press
+   U if you lower the budget and want to see what you are losing. */
+let markUnresolved = qs.has('markunres') ? (Number(qs.get('markunres')) ? 1 : 0) : (store.get('markunres', 0) ? 1 : 0);
+function refreshFluxNorm() {
+  try {
+    /* KINEMATIC TEMPLATE, |M|.  diskFluxTable solves F = (L - L_in)(-dOmega/dr)/(4 pi r)
+       from circular orbits, and circularOrbit() has no physical solution for M < 0: the
+       sign flips made F negative everywhere, the v > 0 clamp zeroed it, and fmax collapsed
+       from 3.48e-5 to 4.73e-14 -- nine orders of magnitude, which made the disk invisible
+       in negative-mass mode (measured, not inferred).  The spacetime still uses the signed
+       M; only the disk's kinematics use |M|.  That is a stated display convention: there
+       is no standard circular-orbit disk model for negative mass. */
+    const t = diskFluxTable(Math.abs(derived.M), derived.a, derived.Q, derived.diskInner, 4093);
+    if (!t) return;
+    fluxNorm = { peak: t.fmax, lin: t.L[0] };
+    /* equatorial photon circular orbits: the critical curve.  Comes from the validated analytic
+       solver in kn.js, not from a fit.  For a naked spacetime the prograde branch can be
+       absent, in which case only the retrograde curve is drawn. */
+    try {
+      const orb = equatorialPhotonOrbits(derived.M, derived.a, derived.Q);
+      bCrit = { pro: Math.abs(orb.bPro) || 0, ret: Math.abs(orb.bRet) || 0 };
+    } catch (e) { bCrit = { pro: 0, ret: 0 }; }
+  } catch (e) { /* keep the previous normalisation rather than blank the disk */ }
+}
+function persist() { if (!SHOT) store.set('params', values); }
+
+/* ---- subsystems ---------------------------------------------------------- */
+const ambient = new Ambient();
+const rig = new CameraRig(canvas, values);
+/* the rig has to know M/a/Q before the first frame: its horizon readout and the
+   shadow-centring pan angle both depend on them (the rig defaulted to a=0.86) */
+rig.setParams(derived.M, derived.a, derived.Q);
+rig.applyStartup(values);
+let qualityLevel = store.get('quality', 'high');
+if (!QUALITY[qualityLevel]) qualityLevel = 'high';
+const aq = new AdaptiveQuality(qualityLevel);
+let debugView = SHOT ? Number(qs.get('debug') || 0) : store.get('debug', 0);
+let pipeline = null, renderer = null;
+let simTime = SHOT && qs.get('t') ? Number(qs.get('t')) : 0;
+/* --- power policy ---------------------------------------------------------
+   The integrator is a full-screen GPU kernel, so an uncapped rAF loop renders
+   ~300 fps and pins the GPU for no visible benefit.  Three guards:
+     (1) a hard frame cap (60 fps Standard/High, 30 Cinematic);
+     (2) the loop stops entirely when the tab is hidden OR the window loses
+         focus, and restarts on the way back -- a visible but unfocused window
+         keeps rAF running, which is exactly what pinned a GPU at 99%;
+     (3) device pixel ratio capped at 1 (quality.js dprCap): 1.5x DPR at the
+         same CSS size is 2.25x the pixels for no new detail.
+   Adjustable at runtime:  window.__KN.setFps(30)  /  setFps(0) to uncap. */
+let fpsCap = 60;
+let lastRender = -1e9;
+let windowFocused = true;
+let gpuTimer = null;            /* real GPU ms per frame, if the driver allows it */
+let running = false, contextLost = false;
+let statePixelsStatus = 'init';
+let stateRepairs = 0, stateRestores = 0, frameCount = 0;
+let pendingRestore = false;
+let fpsAcc = 0, fpsCount = 0, fpsEma = 0, frameMsEma = 16;
+let lastTime = performance.now();
+
+function currentDpr() {
+  const cap = QUALITY[qualityLevel].dprCap;
+  return Math.min(window.devicePixelRatio || 1, cap);
+}
+function doResize(force) {
+  if (!pipeline || !renderer) return;
+  const w = Math.max(2, canvas.clientWidth || window.innerWidth);
+  const h = Math.max(2, canvas.clientHeight || window.innerHeight);
+  pipeline.resize(w, h, currentDpr(), aq.scale, QUALITY[qualityLevel].bloomLevels);
+  renderer.setClearColor(0x000000, 1);
+  /* the render targets -- including BUFFER B that carries the camera state --
+     have just been recreated, so the state pixels are undefined by definition.
+     Flag it so the next check reports an expected restore rather than the
+     corruption this mechanism exists to repair. */
+  pendingRestore = true;
+  if (force !== false) verifyStatePixels(true);
+}
+
+/* ---- state pixel persistence + CPU repair -------------------------------- */
+function packState() {
+  const st = rig.state();
+  const q = st.quat;
+  return {
+    A: [st.r, st.th, st.ph, st.side],
+    B: [st.vel.x, st.vel.y, st.vel.z, Math.max(st.speed, 1e-4)],
+    C: [q.x, q.y, q.z, q.w],
+    D: [1, simTime, st.fov, st.interior],
+  };
+}
+let lastWritten = null;
+function verifyStatePixels(force) {
+  if (!pipeline) return;
+  if (!force && frameCount % 240 !== 0) return;
+  const px = pipeline.readStateRow();
+  /* compare against the state that was ACTUALLY written into the pixels last
+     frame -- comparing against the live camera would flag the one-frame lag in
+     simTime / r as corruption. */
+  const p = lastWritten || packState();
+  if (!px || !px.length) { statePixelsStatus = 'readback n/a'; return; }
+  const want = [...p.A, ...p.B, ...p.C, ...p.D];
+  let worst = 0, worstIdx = -1;
+  for (let i = 0; i < 16; i++) {
+    const a = px[i], b = want[i];
+    if (!Number.isFinite(a)) { worst = Infinity; worstIdx = i; break; }
+    const d = Math.abs(a - b) / (Math.abs(b) + 1e-3);
+    if (d > worst) { worst = d; worstIdx = i; }
+  }
+  if (worst > 0.03) {
+    if (pendingRestore) {
+      /* expected: a resize / context restore / adaptive quality step recreated
+         the target, so the CPU shadow copy simply re-seeds the pixels. */
+      stateRestores++;
+      statePixelsStatus = 're-seeded after resize x' + stateRestores;
+    } else {
+      stateRepairs++;
+      statePixelsStatus = 'REPAIRED x' + stateRepairs + ' (idx ' + worstIdx + ')';
+      if (!SHOT) hud.toast('STATE PIXELS REPAIRED \u2014 CPU BACKUP RESTORED CAMERA', 3200);
+    }
+  } else {
+    statePixelsStatus = 'ok ' + (worst * 100).toFixed(2) + '%';
+  }
+  pendingRestore = false;
+}
+
+/* ---- boot ---------------------------------------------------------------- */
+let shaders = null;
+async function boot() {
+  hud.boot(0.03, 'fetching GLSL sources');
+  try {
+    shaders = await loadShaders(document.baseURI, (p, f) => {
+      hud.boot(0.04 + p * 0.30, 'fetched ' + f);
+    });
+  } catch (e) {
+    hud.fatal('Could not load the GLSL sources.\n\n' + e.message +
+      '\n\nStart a static server in this directory, for example:\n    python -m http.server 8231\nthen open http://127.0.0.1:8231/');
+    return;
+  }
+  hud.log('shaders ready (' + Object.keys(shaders).length + ' programs)');
+
+  try {
+    renderer = new THREE.WebGLRenderer({
+    /* Without this the canvas readback is a race: `toDataURL` after the warm chain can
+       capture a partially composited frame, and the amount varies per page load.  That is
+       exactly the pattern measured here -- Buffer A and Buffer B bit-identical across
+       loads while the final PNG differed, and two captures inside ONE load identical.
+       The raytracer and the bloom chain were never the problem. */
+    preserveDrawingBuffer: true,
+      canvas, antialias: false, alpha: false, depth: false, stencil: false,
+      preserveDrawingBuffer: true, powerPreference: 'high-performance',
+    });
+  } catch (e) {
+    hud.fatal('WebGL2 context creation failed.\n\n' + e.message);
+    return;
+  }
+  window.__KN_RENDERER = renderer;
+  hud.log('renderer: ' + (renderer.capabilities.isWebGL2 ? 'WebGL2' : 'WebGL1') +
+          ' \u00b7 ' + (renderer.getContext().getParameter(renderer.getContext().VERSION) || ''));
+  renderer.autoClear = false;
+  renderer.setClearColor(0x000000, 1);
+
+  pipeline = new Pipeline(renderer, shaders);
+  /* real GPU timing for the adaptive controller (see js/gputimer.js); it
+     degrades to "unavailable" rather than inventing a number */
+  if (!gpuTimer) gpuTimer = new GpuTimer(renderer.getContext());
+  /* the L2 flux normalisation comes from M/a/Q/ISCO, so it must be computed
+     once the pipeline exists -- refreshDerived() only runs on parameter edits. */
+  refreshFluxNorm();
+  doResize(false);
+
+  hud.boot(0.42, 'compiling GLSL (5-7.5 s first run)');
+  const t0 = performance.now();
+  let stopTicker = startBootTicker(t0);
+  try {
+    await compileAll();
+  } catch (e) {
+    hud.log('compile warning: ' + e.message);
+  }
+  stopTicker();
+  hud.log('shader compilation finished in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s');
+
+  hud.boot(0.94, 'first frame');
+  buildFrame(0.016);
+  pipeline.renderFrame();
+  hud.boot(1.0, 'ready');
+  hud.hideBoot();
+
+  /* note: values is reassigned on every edit, so expose it through a getter */
+  window.__KN = { pipeline, rig, renderer, get values() { return values; },
+    derived: () => derived, quality: () => qualityLevel, aq,
+    reframe: () => rig.applyStartup(values),
+    aimInfo: () => shadowAim(derived.M, derived.a, derived.Q) };
+  running = true;
+  lastTime = performance.now();
+  window.__KN.recentre = recentre;
+  window.__KN.setFps = (n) => { fpsCap = Math.max(0, Number(n) || 0); lastRender = -1e9; };
+  window.__KN.power = () => ({ fpsCap, running, hidden: document.hidden, focused: windowFocused, dpr: currentDpr() });
+  window.__KN.gpu = () => (gpuTimer ? gpuTimer.status() : { available: false, mode: 'none' });
+  window.__KN.autoFrame = recentre;      /* alias kept for older tools */
+  window.__KN.darkPatchCentre = darkPatchCentre;
+  requestAnimationFrame(() => { const r = recentre(); if (r) hud.log('recentred: ' + JSON.stringify(r)); });
+  requestAnimationFrame(loop);
+  
+  if (SHOT) scheduleShot();
+  else hud.toast('GARGANTUA-KN \u00b7 press Tab for parameters, F to fly', 4200);
+}
+
+function startBootTicker(t0) {
+  let stop = false;
+  const tick = () => {
+    if (stop) return;
+    const el = (performance.now() - t0) / 1000;
+    hud.boot(0.42 + Math.min(0.50, el / 9.0 * 0.50), 'compiling GLSL / linking programs \u00b7 ' + el.toFixed(1) + ' s');
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  return () => { stop = true; };
+}
+
+async function compileAll() {
+  const scene = new THREE.Scene();
+  const geoms = [new THREE.PlaneGeometry(2, 2), new THREE.PlaneGeometry(2, 2), new THREE.PlaneGeometry(2, 2), new THREE.PlaneGeometry(2, 2)];
+  const mats = [pipeline.matA, pipeline.matBloom, pipeline.matState, pipeline.matImage];
+  const meshes = mats.map((m, i) => { const x = new THREE.Mesh(geoms[i], m); x.frustumCulled = false; scene.add(x); return x; });
+  if (renderer.compileAsync) {
+    await renderer.compileAsync(scene, pipeline.cam);
+  } else {
+    renderer.compile(scene, pipeline.cam);
+  }
+  meshes.forEach((m) => { scene.remove(m); m.geometry.dispose(); });
+}
+
+/* ---- uniforms ------------------------------------------------------------ */
+function buildFrame(dt) {
+  const st = rig.state();
+  const p = packState();
+  lastWritten = p;
+  const uA = pipeline.matA.uniforms;
+  uA.uBackA.value.set(p.A[0], p.A[1], p.A[2], p.A[3]);
+  uA.uBackB.value.set(p.B[0], p.B[1], p.B[2], p.B[3]);
+  uA.uBackC.value.set(p.C[0], p.C[1], p.C[2], p.C[3]);
+  uA.uBackD.value.set(p.D[0], p.D[1], p.D[2], p.D[3]);
+  uA.uTime.value = simTime;
+  uA.uSeed.value = SEED;
+  uA.uMaxSteps.value = Math.max(32, Math.round(values.maxSteps * (qualityLevel === 'standard' ? 0.7 : 1)));
+  uA.uStepScale.value = values.stepScale * QUALITY[qualityLevel].stepScaleMul * aq.stepMul;
+  uA.uTol.value = Math.pow(10, values.tol);
+  uA.uInterior.value = st.interior;
+  uA.uDebug.value = debugView;
+  uA.uTanHalfFov.value = Math.tan((st.fov * Math.PI / 180) / 2);
+  uA.uM.value = derived.M; uA.uA.value = derived.a; uA.uQ.value = derived.Q;
+  uA.uStarDensity.value = values.starDensity;
+  uA.uGalaxy.value = values.galaxy;
+  uA.uDiskTemp.value = values.diskTemp;
+  uA.uDiskThick.value = values.diskThick;
+  uA.uDiskTurb.value = values.turb;
+  uA.uDiskGain.value = values.gain;
+  uA.uDiskDoppler.value = values.doppler;
+  uA.uDiskRedshift.value = values.redshift;
+  uA.uDiskInner.value = derived.diskInner;
+  /* L2: the shader evaluates the relativistic flux law itself; these two
+     scalars only peak-normalise it, and pushing them every frame means the
+     normalisation can never go stale after a parameter change. */
+  uA.uMarkUnresolved.value = markUnresolved;
+    uA.uBCritPro.value = bCrit.pro;
+    uA.uBCritRet.value = bCrit.ret;
+    uA.uForceState.value = SHOT ? 1 : 0;   /* a screenshot uses the exact CPU camera state */
+uA.uBModel.value = Number(values.bfield) || 0;
+    /* The shader parallel transport costs a full Christoffel tensor (64 entries x 4 sigma) plus
+     four metric evaluations per update, and running it every 8 steps took the frame from 60 fps
+     to 22 fps (57 ms) -- so last round's affordability argument, which considered only the
+     ACCURACY of a 32x coarser step, did not account for the flop cost.  It is therefore enabled
+     ONLY in the two assertion views.  Everywhere else the transport does not run, and the
+     renderer stays at its 60 fps target. */
+uA.uTransportEvery.value = 8;   /* the shader gates it by uDebug, which IS pushed per frame */
+uA.uFluxPeak.value = fluxNorm.peak;
+  uA.uFluxLin.value = fluxNorm.lin;
+  uA.uDiskOuter.value = derived.diskOuter;
+  uA.uOmegaScale.value = 1.0;
+
+  const uS = pipeline.matState.uniforms;
+  uS.uS0.value.set(p.A[0], p.A[1], p.A[2], p.A[3]);
+  uS.uS1.value.set(p.B[0], p.B[1], p.B[2], p.B[3]);
+  uS.uS2.value.set(p.C[0], p.C[1], p.C[2], p.C[3]);
+  uS.uS3.value.set(p.D[0], p.D[1], p.D[2], p.D[3]);
+
+  const uI = pipeline.matImage.uniforms;
+  uI.uBloomStrength.value = values.bloomStrength;
+  uI.uBloomRadius.value = values.bloomRadius;
+  uI.uExposure.value = values.exposure;
+  uI.uVignette.value = values.vignette;
+  uI.uGrain.value = values.grain;
+  uI.uAberration.value = values.aberration;
+  uI.uTime.value = simTime;
+  uI.uDebug.value = debugView;
+  return st;
+}
+
+/* ---- main loop ----------------------------------------------------------- */
+function loop(now) {
+  if (!running) return;
+  requestAnimationFrame(loop);
+  /* frame cap: keep the rAF chain alive but skip the GPU work.  dt is measured
+     between RENDERED frames, which is what the sim and the stats want. */
+  if (fpsCap > 0 && now - lastRender < 1000 / fpsCap - 1.0) return;
+  lastRender = now;
+  const dt = Math.min((now - lastTime) / 1000, 0.1);
+  lastTime = now;
+  if (contextLost) return;
+  simTime += dt;
+
+  rig.update(dt);
+  for (const ev of rig.drainEvents()) hud.toast(ev.text, 2600);
+
+  verifyStatePixels(false);
+  /* time the actual GPU work, not the frame interval: with a frame cap the
+     interval is pinned at 16.7 ms whatever the kernel costs, and reporting that
+     as FRAME would be misleading.  The adaptive controller wants the work time
+     too -- it asks whether the GPU is keeping up, not whether we are throttled. */
+  if (gpuTimer) gpuTimer.begin();
+  buildFrame(dt);
+  pipeline.renderFrame();
+  if (gpuTimer) { gpuTimer.end(); gpuTimer.poll(); }
+
+  /* Drive the adaptive controller with REAL GPU time when a timer query is
+     available, so it keeps working at any frame cap.  Without the extension
+     there is no load signal while capped (the interval is pinned to 1/fpsCap),
+     so it only acts uncapped -- feeding it the pinned interval would send it
+     spiralling.  Either way the number used is measured, never invented. */
+  const gpuMs = gpuTimer && gpuTimer.ema !== null ? gpuTimer.ema : null;
+  const loadMs = gpuMs !== null ? gpuMs : dt * 1000;
+  const canControl = gpuMs !== null || fpsCap === 0;
+  if (canControl && aq.update(loadMs)) doResize(true);
+
+  frameCount++;
+  /* FRAME is the interval between frames (what the viewer experiences).  The
+     GPU cost itself is not measurable from JS without a timer query, so it is
+     not faked here: at the cap this reads 16.7 ms by construction. */
+  frameMsEma = frameMsEma * 0.9 + dt * 1000 * 0.1;
+  fpsAcc += dt; fpsCount++;
+  if (fpsAcc > 0.25) { fpsEma = fpsCount / fpsAcc; fpsAcc = 0; fpsCount = 0; updateReadout(); }
+}
+
+/* Stop rendering when nobody is looking.  document.hidden covers a background
+   TAB; window focus covers the window sitting behind another app, which is the
+   case that actually burns a GPU here.  Restarting resets the timers so dt
+   cannot jump by the length of the pause. */
+function applyPowerPolicy() {
+  if (!pipeline) return;
+  const want = !document.hidden && windowFocused && !contextLost;
+  if (want && !running) {
+    running = true; lastTime = performance.now(); lastRender = -1e9;
+    requestAnimationFrame(loop);
+  } else if (!want && running) {
+    running = false;
+  }
+}
+document.addEventListener('visibilitychange', applyPowerPolicy);
+window.addEventListener('focus', () => { windowFocused = true; applyPowerPolicy(); });
+window.addEventListener('blur', () => { windowFocused = false; applyPowerPolicy(); });
+window.addEventListener('pagehide', () => { running = false; });
+
+let lastReadout = 0;
+let warnedClampK = null;   /* L4: fire the naked-singularity toast once per distinct clamp */
+function updateReadout() {
+  const st = rig.state();
+  const sz = pipeline.size;
+  const inst = Math.round(fpsEma);
+  const rgb = (v) => v > 55 ? 'good' : (v > 30 ? 'warn' : 'bad');
+  const universe = st.r < 0 ? 'ANTIVERSE (r<0)' : (st.interior ? 'INTERIOR (r<r+)' : 'OUR UNIVERSE');
+  hud.setReadout({
+    fps: inst + ' fps', cls_fps: rgb(inst),
+    /* GPU time when measured, frame interval otherwise -- the suffix says which */
+    frame: (gpuTimer && gpuTimer.ema !== null ? gpuTimer.ema.toFixed(1) + ' ms gpu' : frameMsEma.toFixed(1) + ' ms iv'),
+    quality: QUALITY[qualityLevel].name + ' \u00b7 ' + (aq.scale * 100).toFixed(0) + '%' + (fpsCap > 0 ? ' \u00b7 \u2264' + fpsCap + 'fps' : '') + (running ? '' : ' \u00b7 PAUSED'),
+    buffer: sz.aw + '\u00d7' + sz.ah + '  (' + sz.cw + '\u00d7' + sz.ch + ' out)',
+    r: st.r.toFixed(3) + ' M',
+    ang: (st.th * 180 / Math.PI).toFixed(1) + '\u00b0 / ' + (st.ph * 180 / Math.PI).toFixed(1) + '\u00b0',
+    universe, cls_universe: st.r < 0 ? 'good' : (st.interior ? 'warn' : ''),
+    speed: st.speed.toFixed(3) + ' c',
+    maq: derived.M.toFixed(2) + ' / ' + derived.a.toFixed(3) + ' / ' + derived.Q.toFixed(3),
+    /* L4: the charge is a spacetime-exploration parameter, so the readout says
+       out loud how far it is from anything an astrophysical hole could hold. */
+    qphys: (() => {
+      if (!(derived.Q > 0)) return 'Q = 0 \u00b7 real holes are screened to ~0';
+      const cp = chargePhysicality(derived.Q / derived.M, { aOverM: derived.a / derived.M });
+      /* stateless clamp test: sanitize() parks the values exactly on the
+         sub-extremal bound a^2 + Q^2 = 0.995 M^2, so landing on it means the
+         user's request was pulled back (keeping a record instead does not work,
+         because the second sanitize pass sees the already-clamped values). */
+      const sRel = (derived.a * derived.a + derived.Q * derived.Q) / (derived.M * derived.M);
+      const onBound = Math.abs(sRel - 0.995) < 1e-6;
+      return 'real |Q|/M < ' + cp.reference.toExponential(1) +
+             ' \u00b7 slider x' + Math.pow(10, cp.ordersAbove).toExponential(0) +
+             (onBound ? ' \u00b7 a\u00b2+Q\u00b2 ON sub-extremal bound (clamped)' : '');
+    })(),
+    cls_qphys: derived.Q > 0 ? 'warn' : '',
+    horizons: derived.naked ? 'NAKED' : (derived.rp.toFixed(3) + ' / ' + derived.rm.toFixed(3)),
+    ergo: derived.ergo.toFixed(3) + ' M',
+    isco: derived.isco.toFixed(3) + ' M',
+    disk: derived.diskInner.toFixed(2) + ' \u2192 ' + derived.diskOuter.toFixed(1) + ' M',
+    mode: st.mode.toUpperCase() + (rig.input.locked ? ' \u00b7 LOCKED' : ''),
+    statepix: statePixelsStatus + '  [' + stateRepairs + ' repairs / ' + stateRestores + ' restores]',
+    integ: '\u2264 ' + pipeline.matA.uniforms.uMaxSteps.value + ' steps \u00b7 h\u2080 ' + pipeline.matA.uniforms.uStepScale.value.toFixed(3),
+  });
+  hud.setCrosshair(st.mode === 'flight');
+  hud.markButtons(st.mode, qualityLevel);
+}
+
+/* ---- actions ------------------------------------------------------------- */
+function setMode(m) {
+  if (m === 'flight') { rig.setMode('flight'); rig.input.requestLock(); }
+  else { rig.setMode(m); rig.input.exitLock(); }
+  hud.markButtons(m, qualityLevel);
+  hud.toast(m === 'flight' ? 'FLIGHT \u00b7 WASD thrust, Q/E roll, mouse look, Esc releases' : m.toUpperCase());
+}
+function applyPreset(i) {
+  const p = rig.applyPreset(i);
+  requestAnimationFrame(() => requestAnimationFrame(() => recentre()));
+  values.camR = p.r; values.camTheta = (p.th * 180) / Math.PI; values.initSpeed = Math.abs(p.vel[0]);
+  hud.syncValues(values); refreshDerived();
+  if (p.mode === 'flight') rig.input.requestLock();
+  hud.toast(p.name, 2200);
+}
+function setQuality(q) {
+  if (!QUALITY[q]) return;
+  qualityLevel = q; aq.setLevel(q);
+  fpsCap = QUALITY[q].targetFps;      /* the tier's frame budget */
+  store.set('quality', q);
+  doResize(true);
+  hud.markButtons(rig.mode, q);
+  hud.toast('QUALITY \u00b7 ' + QUALITY[q].name + ' (' + (QUALITY[q].renderScale * 100) + '% res, \u2264 ' + QUALITY[q].maxSteps + ' steps)', 2600);
+}
+function setDebug(n) {
+  /* was ((n % 10) + 10) % 10, i.e. capped at ten channels; the band and special views are
+     codes 11-18 and are chosen by name from the panel selector. */
+  /* The upper bound used to be hard-coded (10, then 18) and silently clamped the newer
+     views: selecting 21 in the panel actually rendered 18.  Derive it from the VIEWS list
+     instead so it cannot drift again. */
+  const VIEW_MAX = VIEWS.reduce((m, v) => Math.max(m, v.n), 0);
+  debugView = Math.max(0, Math.min(VIEW_MAX, Math.round(Number(n) || 0)));
+  store.set('debug', debugView);
+  hud.setLegend(debugView);
+  hud.setView(debugView);
+  const nm = VIEWS.find((v) => v.n === debugView);
+  hud.toast(nm ? nm.label : ('VIEW ' + debugView), 1600);
+}
+async function toggleMusic() {
+  const on = await ambient.setEnabled(!ambient.on);
+  store.set('music', on);
+  hud.btns.music.textContent = on ? '\u266b ON' : '\u266b OFF';
+  hud.btns.music.classList.toggle('on', on);
+  hud.toast(on ? 'AMBIENT ON' : 'AMBIENT OFF');
+}
+function copyLink() {
+  const u = new URL(location.href);
+  u.search = '';
+  const p = encodeParams(values);
+  p.forEach((v, k) => u.searchParams.set(k, v));
+  u.searchParams.set('quality', qualityLevel);
+  u.searchParams.set('debug', String(debugView));
+  const txt = u.toString();
+  if (navigator.clipboard) navigator.clipboard.writeText(txt).then(() => hud.toast('LINK COPIED'), () => hud.toast(txt, 6000));
+  else hud.toast(txt, 6000);
+}
+function saveShot(name) {
+  try {
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url; a.download = (name || 'gargantua-kn-' + Date.now()) + '.png';
+    a.click();
+    hud.toast('PNG SAVED');
+  } catch (e) { hud.toast('screenshot failed: ' + e.message); }
+}
+
+/* ---- URL automation: ?shot=1&t=12&preset=2 ------------------------------- */
+function scheduleShot() {
+  const preset = Number(qs.get('preset'));
+  if (Number.isFinite(preset)) rig.applyPreset(Math.max(0, Math.min(3, preset)));
+  if (qs.has('r')) { rig.r = Number(qs.get('r')); }
+  if (qs.has('theta')) { rig.th = Number(qs.get('theta')) * Math.PI / 180; }
+  if (qs.has('phi')) { rig.ph = Number(qs.get('phi')) * Math.PI / 180; }
+  /* Pin the pose.  The rig integrates the camera from initSpeed, so the pose at capture
+     time depended on how many frames the LIVE loop happened to render before it froze.
+     That drift was ~1e-4 M, i.e. every pixel shifted by well under one luma step -- which
+     is exactly what the localisation showed: all 2304 cells differing, each by < 0.06 of
+     a level, PNG length off by hundreds of bytes.  Re-asserted every warm frame below. */
+  const pinR = rig.r, pinTh = rig.th, pinPh = rig.ph;
+  const t = Number(qs.get('t') || 0);
+  simTime = Number.isFinite(t) ? t : 0;
+  /* FREEZE the live loop.  It used to keep running beside this warm chain, so it
+     advanced simTime by ~0.1 between the warm-up and the capture: ?shot=1&t=12 was
+     landing at t = 12.09 ... 12.18 depending on frame timing, and every
+     time-dependent field (turbulence shear, matrix rain) differed between two runs
+     of the SAME URL.  That is what made several symmetry tests of mine fail. */
+  running = false;
+  aq.scale = QUALITY[qualityLevel].renderScale;
+  aq.level.adaptive = false;
+  doResize(false);
+  let n = 0, framed = false;
+  const warm = () => {
+    rig.r = pinR; rig.th = pinTh; rig.ph = pinPh;   /* no camera drift in a screenshot */
+    buildFrame(0.016);
+    pipeline.renderFrame();
+    n++;
+    /* frame the shot exactly like the live page, after the preset pose is
+       applied and the first frames have settled, but before the capture */
+    if (!framed && n >= 2) {
+      framed = true;
+      recentre();
+      requestAnimationFrame(warm);
+      return;
+    }
+    /* 24 warm frames instead of 6: the run-to-run difference is intermittent (~50% of
+       pairs) and hit M = +1 configurations too, so it is not the negative-mass flux (a
+       hypothesis the sweep falsified).  With the camera pinned and the state-pixel path
+       never firing, an under-settled first frames is the remaining candidate. */
+    if (n < 24) { requestAnimationFrame(warm); return; }
+    simTime = Number.isFinite(t) ? t : 0;   /* pin the clock on the capture frame */
+    window.__KN_SHOT_READY = true;
+    window.__KN_SHOT_DATAURL = canvas.toDataURL('image/png');
+    /* SECOND capture, same page load, one frame later, same pinned clock and pose.  Any
+       difference between the two is frame-to-frame (shader/driver); if they always match,
+       the run-to-run difference lives in load-time initialisation instead. */
+    requestAnimationFrame(() => {
+      try {
+        rig.r = pinR; rig.th = pinTh; rig.ph = pinPh;
+        simTime = Number.isFinite(t) ? t : 0;
+        buildFrame(0.016);
+        pipeline.renderFrame();
+        window.__KN_SHOT_DATAURL2 = canvas.toDataURL('image/png');
+        window.__KN_SHOT_READY2 = true;
+      } catch (e) { window.__KN_SHOT_ERROR2 = String(e && e.message ? e.message : e); }
+    });
+    window.__KN_SHOT_META = {
+      seed: SEED, t: simTime, statePixelsStatus, stateRepairs, stateRestores,
+      rigR: rig.r, rigTh: rig.th, rigPh: rig.ph, pinR, pinTh, pinPh,
+      preset, quality: qualityLevel, debug: debugView,
+      r: rig.r, theta: rig.th, phi: rig.ph, size: pipeline.size,
+      aimBiasDeg: [+(rig.aimBiasYaw * 180 / Math.PI).toFixed(4), +(rig.aimBiasPitch * 180 / Math.PI).toFixed(4)],
+      params: { ...values }, derived,
+    };
+    if (qs.has('dl')) saveShot('gargantua-kn-shot-t' + simTime);
+  };
+  requestAnimationFrame(warm);
+}
+
+/* ---------------------------------------------------------------------------
+   Compositional auto-framing.
+   lookAtCenter() puts the photon ring in the middle, which is the physically
+   meaningful aim, but the region a viewer reads as "the black hole" is the
+   VISIBLE dark area -- and the lensed near side of the disk eats its lower
+   part, so that area sits noticeably above centre.  This measures the dark
+   region on the rendered frame and pans the camera so it lands in the middle.
+   One-shot, capped, skipped in shot mode, and never applied while flying.
+   ------------------------------------------------------------------------- */
+function qrotX(q, v) {
+  const ux = q.x, uy = q.y, uz = q.z;
+  const cx = uy * v[2] - uz * v[1], cy = uz * v[0] - ux * v[2], cz = ux * v[1] - uy * v[0];
+  const tx = cx + q.w * v[0], ty = cy + q.w * v[1], tz = cz + q.w * v[2];
+  const dx = uy * tz - uz * ty, dy = uz * tx - ux * tz, dz = ux * ty - uy * tx;
+  return [v[0] + 2 * dx, v[1] + 2 * dy, v[2] + 2 * dz];
+}
+
+/* screen NDC -> the ray's direction components in the local ZAMO frame.  One
+   place builds the ray, so the framing predicates cannot drift apart. */
+function localDirOfNdc(nx, ny) {
+  const st = rig.state(), sz = pipeline.size;
+  const aspect = sz.aw / Math.max(sz.ah, 1);
+  const t = Math.tan((st.fov * Math.PI) / 360);
+  let v = [nx * aspect * t, ny * t, -1];
+  const L = Math.hypot(v[0], v[1], v[2]);
+  v = [v[0] / L, v[1] / L, v[2] / L];
+  const nw = qrotX(st.quat, v);
+  const s = Math.sin(st.th), c = Math.cos(st.th), ph = st.ph;
+  const rh = [s * Math.cos(ph), s * Math.sin(ph), c];
+  const thv = [c * Math.cos(ph), c * Math.sin(ph), -s];
+  const pph = [-Math.sin(ph), Math.cos(ph), 0];
+  return [nw[0] * rh[0] + nw[1] * rh[1] + nw[2] * rh[2],
+          nw[0] * thv[0] + nw[1] * thv[1] + nw[2] * thv[2],
+          nw[0] * pph[0] + nw[1] * pph[1] + nw[2] * pph[2]];
+}
+
+/* Classify one screen direction with the same CPU geodesic twin the physics
+   suite validates, so the answer does not depend on the resolution of any
+   image analysis -- an earlier flood-fill version kept leaking out of the
+   shadow through the thin photon ring once the frame was down-sampled. */
+function traceNdc(nx, ny, stopAtDisk) {
+  const st = rig.state(), dv = derived;
+  return trace({ M: dv.M, a: dv.a, Q: dv.Q, r0: st.r, th0: st.th, ph0: st.ph,
+    n: localDirOfNdc(nx, ny), maxSteps: 6000, tol: 1e-5, stepScale: 0.6,
+    rFar: Math.max(Math.abs(st.r) * 1.55 + 6, 34), diskOuter: dv.diskOuter,
+    stopAtDisk: !!stopAtDisk });
+}
+/* CAPTURED = inside the shadow silhouette.  This is the framing target: it is
+   the same object the GPU debug-10 escape mask paints, and the object a reader
+   calls "the black hole".  The disk is deliberately irrelevant here, so the
+   ray is NOT stopped when it meets the disk. */
+const isCaptureAt = (nx, ny) => !traceNdc(nx, ny, false).escaped;
+/* genuinely DARK on screen = captured AND never met the disk on the way in;
+   otherwise the disk lights the pixel up */
+const isDarkAt = (nx, ny) => { const r = traceNdc(nx, ny, true); return !r.escaped && r.crossR < 0; };
+
+/* Signed NDC of the shadow boundary along one screen axis, by BISECTION between
+   the frame centre (captured) and the frame edge (escaped).  Bisection, not a
+   sampling sweep: a 100-sample sweep quantises the boundary to +-0.01 NDC, which
+   at 1280 px is +-6 px -- wider than the tolerance the framing needs. */
+function shadowEdge(axis, sign) {
+  const at = (u) => isCaptureAt(axis === 'x' ? sign * u : 0, axis === 'y' ? sign * u : 0);
+  if (!at(0)) return NaN;                 /* centre is not inside the shadow */
+  if (at(0.98)) return NaN;               /* shadow spans the whole frame */
+  let lo = 0, hi = 0.98;
+  for (let i = 0; i < 20; i++) { const m = 0.5 * (lo + hi); if (at(m)) lo = m; else hi = m; }
+  return sign * 0.5 * (lo + hi);
+}
+
+/* ---------------------------------------------------------------------------
+   Closed-loop centring of the SHADOW SILHOUETTE.
+   Why a measured loop.  The previous framing stacked TWO open-loop estimates
+   aimed at DIFFERENT objects: the analytic frame-dragging pan aimYaw() ( =
+   b_mid/r, aimK = 1, calibrated on the dark region's bounding box ) and a
+   composition bias aimed at the VISIBLE dark patch (the shadow minus whatever
+   the lensed near side of the disk covers).  At the default pose the rig
+   reported aimYaw = +4.476 deg together with a bias of -3.057 deg yaw and
+   +4.124 deg pitch: the two largely cancelled each other, and the measured
+   shadow-centre residual was still -30 px (-4.69% of the half width).
+   Separately, aimShift()'s dead band was 0.03 NDC (~19 px horizontally), WIDER
+   than this function's own 0.006 NDC convergence test, so any residual between
+   about 4 px and 19 px was silently never corrected at all.
+   The loop below removes both problems: it measures the four shadow-boundary
+   crossings through the frame centre and nulls their midpoint.  Centring the
+   VISIBLE dark patch instead would mean deliberately moving the camera until
+   the disk occlusion is disguised -- the occlusion is physics, so the camera
+   must not be used to hide it.  darkPatchCentre() reports that offset instead.
+   --------------------------------------------------------------------------- */
+function recentre(maxIter = 5) {
+  /* B23: this used to early-return when SHOT was set, so the documented
+     deterministic screenshot API ( ?shot=1&t=..&preset=.. ) produced a
+     DIFFERENTLY FRAMED image from the live page.  recentre() is deterministic
+     -- a CPU geodesic bisection with no randomness -- so running it in shot
+     mode costs no reproducibility and makes the two paths agree.  Flight mode
+     is still skipped, exactly as on the live page. */
+  if (!pipeline || rig.mode === 'flight') return null;
+  const aspect = (canvas.clientWidth || 16) / (canvas.clientHeight || 9);
+  rig.lookAtCenter();
+  let last = null;
+  for (let it = 0; it < maxIter; it++) {
+    const xr = shadowEdge('x', +1), xl = shadowEdge('x', -1);
+    const yt = shadowEdge('y', +1), yb = shadowEdge('y', -1);
+    if (![xr, xl, yt, yb].every(Number.isFinite)) return { failed: 'shadow boundary not found' };
+    const cx = 0.5 * (xr + xl), cy = 0.5 * (yt + yb);
+    last = { iter: it + 1,
+             residualNdc: [+cx.toFixed(5), +cy.toFixed(5)],
+             residualPx: [+(cx * canvas.clientWidth / 2).toFixed(1), +(cy * canvas.clientHeight / 2).toFixed(1)],
+             shadowRadiusNdc: [+(0.5 * (xr - xl)).toFixed(4), +(0.5 * (yt - yb)).toFixed(4)],
+             biasDeg: [+(rig.aimBiasYaw * 180 / Math.PI).toFixed(3), +(rig.aimBiasPitch * 180 / Math.PI).toFixed(3)] };
+    if (Math.abs(cx) < 0.0015 && Math.abs(cy) < 0.0015) { last.converged = true; break; }
+    rig.aimShift(cx, cy, aspect);
+    rig.lookAtCenter();
+    rig.syncOrbitFromBL();
+  }
+  return last;
+}
+
+/* Diagnostic only: where the VISIBLE dark patch (shadow minus disk occlusion)
+   sits, in NDC.  Reported so the remaining composition offset stays visible and
+   honest instead of being hidden by a camera shift. */
+function darkPatchCentre() {
+  const N = 100, span = (axis) => {
+    let lo = null, hi = null;
+    for (let i = 0; i <= N; i++) {
+      const t = 1 - (2 * i) / N;
+      const nx = axis === 'x' ? t : 0, ny = axis === 'y' ? t : 0;
+      if (isDarkAt(nx, ny)) { if (hi === null) hi = t; lo = t; }
+    }
+    if (lo === null || hi === null) return null;
+    return (lo + hi) / 2;
+  };
+  const mx = span('x'), my = span('y');
+  return (mx === null || my === null) ? null : { ndc: [+mx.toFixed(4), +my.toFixed(4)] };
+}
+
+/* ---- input --------------------------------------------------------------- */
+addEventListener('keydown', (e) => {
+  if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName) && e.code !== 'Tab') return;
+  const k = e.code;
+  if (k.startsWith('Digit')) { const n = Number(k.slice(5)); setDebug(n); e.preventDefault(); return; }
+  if (/^F[1-4]$/.test(k)) { applyPreset(Number(k.slice(1)) - 1); e.preventDefault(); return; }
+  /* An arrow key while orbiting would otherwise do nothing at all, which is
+     exactly how the movement keys felt dead: enter flight on the first one. */
+  if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') {
+    if (rig.mode !== 'flight') { setMode('flight'); return; }
+  }
+
+  switch (k) {
+    /* F and R are dual-purpose: inside flight mode they are the vertical
+       thrusters (handled by the rig), so the global actions are suppressed
+       there.  Esc leaves flight and releases the pointer. */
+    case 'KeyF': if (rig.mode !== 'flight') setMode('flight'); break;
+    case 'Escape': if (rig.mode === 'flight') setMode('orbit'); break;
+    case 'KeyC': setMode(rig.mode === 'cinematic' ? 'orbit' : 'cinematic'); break;
+    case 'KeyH': hud.toggleHud(); break;
+        case 'KeyU': markUnresolved = markUnresolved > 0.5 ? 0 : 1; store.set('markunres', markUnresolved); hud.toast(markUnresolved ? '\u672a\u89e3\u7b97\u50cf\u7d20\u6807\u8bb0\uff1a\u5f00' : '\u672a\u89e3\u7b97\u50cf\u7d20\u6807\u8bb0\uff1a\u5173', 1600); break;
+        case 'Comma': { const ns0 = VIEWS.map((v) => v.n), i0 = ns0.indexOf(debugView); setDebug(ns0[((i0 < 0 ? 0 : i0) - 1 + ns0.length) % ns0.length]); break; }
+        case 'Period': { const ns1 = VIEWS.map((v) => v.n), i1 = ns1.indexOf(debugView); setDebug(ns1[((i1 < 0 ? 0 : i1) + 1) % ns1.length]); break; }
+    case 'KeyM': toggleMusic(); break;
+    case 'KeyR': if (rig.mode !== 'flight') { rig.applyStartup(values); hud.toast('CAMERA RE-FRAMED'); } break;
+    case 'KeyS': saveShot(); break;
+    case 'Tab': hud.togglePanel(); e.preventDefault(); break;
+    case 'BracketLeft': { const i = QUALITY_ORDER.indexOf(qualityLevel); setQuality(QUALITY_ORDER[Math.max(0, i - 1)]); break; }
+    case 'BracketRight': { const i = QUALITY_ORDER.indexOf(qualityLevel); setQuality(QUALITY_ORDER[Math.min(QUALITY_ORDER.length - 1, i + 1)]); break; }
+    case 'KeyP': { const i = (Number(store.get('preset', 0)) + 1) % PRESETS.length; store.set('preset', i); applyPreset(i); break; }
+    default: break;
+  }
+});
+
+canvas.addEventListener('click', () => { if (rig.mode === 'flight' && !rig.input.locked) rig.input.requestLock(); });
+addEventListener('resize', () => doResize(true));
+addEventListener('orientationchange', () => setTimeout(() => doResize(true), 260));
+document.addEventListener('fullscreenchange', () => setTimeout(() => doResize(true), 120));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', () => setTimeout(() => doResize(true), 120));
+
+/* ---- context loss recovery ---------------------------------------------- */
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  contextLost = true;
+  window.__KN_ERRORS.push('webglcontextlost');
+  hud.boot(0.5, 'WebGL context lost \u2014 waiting for restore');
+  hud.el.boot.style.display = '';
+  hud.el.boot.classList.remove('gone');
+  hud.log('context lost at frame ' + frameCount);
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  hud.log('context restored, rebuilding render targets');
+  try {
+    /* Deliberately NOT disposing the dead pipeline: after a context loss every
+       GL object is already gone, and three's material-dispose path would touch
+       program records that no longer exist (a real "cannot read property
+       isReady of undefined" crash).  The old JS objects are simply dropped. */
+    renderer.setRenderTarget(null);
+    if (renderer.resetState) renderer.resetState();
+    pipeline = new Pipeline(renderer, shaders);
+  /* real GPU timing for the adaptive controller (see js/gputimer.js); it
+     degrades to "unavailable" rather than inventing a number */
+  if (!gpuTimer) gpuTimer = new GpuTimer(renderer.getContext());
+  /* the L2 flux normalisation comes from M/a/Q/ISCO, so it must be computed
+     once the pipeline exists -- refreshDerived() only runs on parameter edits. */
+  refreshFluxNorm();
+    doResize(true);
+    contextLost = false;
+    lastTime = performance.now();
+    hud.boot(1.0, 'restored');
+    hud.hideBoot();
+    hud.toast('WEBGL CONTEXT RESTORED');
+    compileAll().catch((e) => hud.log('recompile warning: ' + e.message));
+  } catch (err) {
+    hud.fatal('context restore failed:\n' + err.message);
+  }
+});
+
+/* ---- music preference (needs a gesture, so arm on the first interaction) -- */
+if (!SHOT && store.get('music', false)) {
+  const arm = () => {
+    removeEventListener('pointerdown', arm); removeEventListener('keydown', arm);
+    ambient.setEnabled(true).then((on) => {
+      hud.btns.music.textContent = on ? '\u266b ON' : '\u266b OFF';
+      hud.btns.music.classList.toggle('on', !!on);
+    });
+  };
+  addEventListener('pointerdown', arm, { once: true });
+  addEventListener('keydown', arm, { once: true });
+}
+
+boot();
+window.__KN_READY = true;
+
+/* optional verification harness: only pulled in with ?audit=1 so the normal
+   payload stays untouched */
+if (qs.has('audit')) {
+  import('./audit.js').then((m) => { window.__AUDIT = m.AUDIT; hud.log('audit harness ready'); })
+    .catch((e) => { window.__KN_ERRORS.push('audit load failed: ' + e.message); hud.log('audit load failed: ' + e.message); });
+}
+/* (A) in-app assertion harness: run on demand with ?poltest=1, after the renderer is up */
+  if (new URLSearchParams(location.search).get('poltest') === '1') {
+    setTimeout(() => {
+      try {
+        runPolTest(canvas, (v) => setDebug(v)).then((r) => {
+        /* a broken expression lived here; removed rather than shipped */
+          hud.toast('POLTEST ' + r.passed + ' passed / ' + r.failed + ' failed', 6000);
+          console.log('[poltest]', JSON.stringify(r, null, 1));
+        });
+      } catch (e) { console.error('[poltest] threw', e); }
+    }, 9000);
+  }

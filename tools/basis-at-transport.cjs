@@ -1,0 +1,12 @@
+const fs = require('fs');
+const f = 'shaders/bufferA.frag';
+let T = fs.readFileSync(f, 'utf8');
+const bal = (s) => { const o=(s.match(/{/g)||[]).length, c=(s.match(/}/g)||[]).length, p=(s.match(/\(/g)||[]).length, q=(s.match(/\)/g)||[]).length; return {ok:o===c&&p===q}; };
+const must = (c,m) => { if(!c){console.log('ABORT: '+m);process.exit(1);} };
+const rep = (a, b, tag) => { const n = T.split(a).length - 1; must(n === 1, tag + ': found ' + n); T = T.split(a).join(b); console.log('ok: ' + tag); };
+rep('  float fPolN0 = 1.0;', '  float fPolN0 = 1.0;\n  float gAn = 1.0, gBn = 1.0;   /* the basis norms AT THE TRANSPORT POINT, so they mean the same thing as fPolNlast */', 'state');
+rep('          gB   = knTransportStep(r, th, pT, gB, tLen);', '          gB   = knTransportStep(r, th, pT, gB, tLen);\n          gAn = dot(gA, gNu * gA);\n          gBn = dot(gB, gNu * gB);', 'capture at the transport point');
+rep('evpaDbg = vec4(fpE, detG, G11, G22);', 'evpaDbg = vec4(fpE, detG, gAn, gBn);', 'payload');
+const b = bal(T); console.log('balance', JSON.stringify(b));
+must(b.ok, 'unbalanced');
+fs.writeFileSync(f, T); console.log('WROTE');

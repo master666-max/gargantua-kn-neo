@@ -1,0 +1,9 @@
+# Repository text is LF, but the Windows launchers are checked out with CRLF:
+# cmd.exe mis-parses an LF-only .cmd (measured earlier in this project), and
+# wscript.exe expects CRLF too.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.png binary
+*.wav binary

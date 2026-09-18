@@ -1,0 +1,84 @@
+======================================================================
+ A. Schwarzschild  -- analytic gamma must be exactly pi
+   M=1  a=0  Q=0   (PROGRADE)
+   critical equatorial photon orbit : r_c = 3.0000000   b_c = 5.196152423
+   analytic gamma = pi*sqrt(F''(u_c)/2) = 3.141592654   [F'' = 2.0000000, F' residual 2.22e-7]
+   measured slope dPhi/dln x = -0.9998643  (R^2 = 0.999999954, n=7)   inner-half slope = -1.0000197
+   => gamma from slope = 3.1420191   vs analytic 3.1415927   (0.014%)
+   Bozza abar check: measured -1/abar = 0.9998643   predicted pi/gamma = 1.0000000   (-0.014%)
+   ------------------------------------------------------------------
+        x            b          |dPhi|     n_half   steps    end
+      1.0e-3    5.20134858    9.53180   3.03407     389  escaped
+      1.0e-4    5.19667204   11.83122   3.76600     474  escaped
+      1.0e-5    5.19620438   14.13533   4.49941     560  escaped
+      1.0e-6    5.19615762   16.43717   5.23211     645  escaped
+      1.0e-7    5.19615294   18.73904   5.96482     730  escaped
+      1.0e-8    5.19615247   21.04090   6.69753     815  escaped
+      1.0e-9    5.19615243   23.34532   7.43105     901  escaped
+   subrings: d_n = impact-parameter offset of the n-th half-orbit image;
+   d_{n+1}/d_n must converge to exp(-gamma) = 0.0432139
+      d_4=4.79667e-5  d_5=2.07393e-6  ratio=0.0432368  (0.05% vs exp(-gamma))
+      d_5=2.07393e-6  d_6=8.95342e-8  ratio=0.0431714  (-0.10% vs exp(-gamma))
+      d_6=8.95342e-8  d_7=3.86937e-9  ratio=0.0432166  (0.01% vs exp(-gamma))
+======================================================================
+======================================================================
+ B. Reissner-Nordstrom Q = 0.6M
+   M=1  a=0  Q=0.6   (PROGRADE)
+   critical equatorial photon orbit : r_c = 2.7369317   b_c = 4.858694193
+   analytic gamma = pi*sqrt(F''(u_c)/2) = 2.986797295   [F'' = 1.8077641, F' residual 1.97e-7]
+   measured slope dPhi/dln x = -1.0516978  (R^2 = 0.999999955, n=7)   inner-half slope = -1.0518245
+   => gamma from slope = 2.9871630   vs analytic 2.9867973   (0.012%)
+   Bozza abar check: measured -1/abar = 1.0516978   predicted pi/gamma = 1.0518265   (-0.012%)
+   ------------------------------------------------------------------
+        x            b          |dPhi|     n_half   steps    end
+      1.0e-3    4.86355289    9.90140   3.15171     404  escaped
+      1.0e-4    4.85918006   12.32154   3.92207     494  escaped
+      1.0e-5    4.85874278   14.74146   4.69235     583  escaped
+      1.0e-6    4.85869905   17.16409   5.46350     673  escaped
+      1.0e-7    4.85869468   19.58672   6.23465     763  escaped
+      1.0e-8    4.85869424   22.00934   7.00579     853  escaped
+      1.0e-9    4.85869420   24.42960   7.77618     942  escaped
+   subrings: d_n = impact-parameter offset of the n-th half-orbit image;
+   d_{n+1}/d_n must converge to exp(-gamma) = 0.0504488
+      d_4=7.92188e-5  d_5=3.99073e-6  ratio=0.0503760  (-0.14% vs exp(-gamma))
+      d_5=3.99073e-6  d_6=2.01504e-7  ratio=0.0504930  (0.09% vs exp(-gamma))
+      d_6=2.01504e-7  d_7=1.01744e-8  ratio=0.0504923  (0.09% vs exp(-gamma))
+======================================================================
+======================================================================
+ C. Kerr a = 0.9M, prograde critical orbit
+   M=1  a=0.9  Q=0   (PROGRADE)
+   critical equatorial photon orbit : r_c = 1.5578546   b_c = 2.844421403
+   analytic gamma = pi*sqrt(F''(u_c)/2) = 1.216012614   [F'' = 0.2996446, F' residual -9.30e-7]
+   measured slope dPhi/dln x = -2.5832370  (R^2 = 0.999999975, n=7)   inner-half slope = -2.5835849
+   => gamma from slope = 1.2161457   vs analytic 1.2160126   (0.011%)
+   Bozza abar check: measured -1/abar = 2.5832370   predicted pi/gamma = 2.5835198   (-0.011%)
+   ------------------------------------------------------------------
+        x            b          |dPhi|     n_half   steps    end
+      1.0e-3    2.84726582   19.26041   6.13078     764  escaped
+      1.0e-4    2.84470585   25.20324   8.02244     984  escaped
+      1.0e-5    2.84444985   31.15095   9.91565    1204  escaped
+      1.0e-6    2.84442425   37.10060  11.80949    1425  escaped
+      1.0e-7    2.84442169   43.04892  13.70290    1645  escaped
+      1.0e-8    2.84442143   48.99726  15.59631    1865  escaped
+      1.0e-9    2.84442141   54.94756  17.49035    2086  escaped
+   subrings: d_n = impact-parameter offset of the n-th half-orbit image;
+   d_{n+1}/d_n must converge to exp(-gamma) = 0.2964097
+      d_7=3.47136e-4  d_8=1.02769e-4  ratio=0.2960495  (-0.12% vs exp(-gamma))
+      d_8=1.02769e-4  d_9=3.04545e-5  ratio=0.2963381  (-0.02% vs exp(-gamma))
+      d_9=3.04545e-5  d_10=9.02532e-6  ratio=0.2963546  (-0.02% vs exp(-gamma))
+      d_10=9.02532e-6  d_11=2.67567e-6  ratio=0.2964628  (0.02% vs exp(-gamma))
+      d_11=2.67567e-6  d_12=7.93196e-7  ratio=0.2964474  (0.01% vs exp(-gamma))
+      d_12=7.93196e-7  d_13=2.35089e-7  ratio=0.2963822  (-0.01% vs exp(-gamma))
+      d_13=2.35089e-7  d_14=6.96763e-8  ratio=0.2963825  (-0.01% vs exp(-gamma))
+      d_14=6.96763e-8  d_15=2.06509e-8  ratio=0.2963834  (-0.01% vs exp(-gamma))
+      d_15=2.06509e-8  d_16=6.12158e-9  ratio=0.2964315  (0.01% vs exp(-gamma))
+      d_16=6.12158e-9  d_17=1.81506e-9  ratio=0.2965026  (0.03% vs exp(-gamma))
+======================================================================
+
+-- cross-check: exact equatorial state vs ZAMO screen init (same b) --
+   a=0 Q=0  b_target=5.20134858  b(s=0.085232)=5.20134858  [bracket 5.2013..5.2013 ok]
+        dPhi  zamo=9.531715  exact=9.531798   dev=-0.0009%   steps 389/389   verdict esc/esc
+   a=0.9 Q=0  b_target=2.84726582  b(s=0.046653)=2.84726582  [bracket 2.8473..2.8473 ok]
+        dPhi  zamo=19.260368  exact=19.260412   dev=-0.0002%   steps 764/764   verdict esc/esc
+   a=0.5 Q=0.5  b_target=3.78781267  b(s=0.062070)=3.78781267  [bracket 3.7878..3.7878 ok]
+        dPhi  zamo=12.453244  exact=12.453302   dev=-0.0005%   steps 505/505   verdict esc/esc

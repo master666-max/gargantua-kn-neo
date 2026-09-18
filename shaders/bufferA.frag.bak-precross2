@@ -1,0 +1,1243 @@
+/* ============================================================================
+ *  GARGANTUA-KN   .   BUFFER A   .   KERR-NEWMAN NULL-GEODESIC RAYTRACER
+ * ============================================================================
+ *
+ *  WHAT THIS PASS DOES
+ *  ---------------------------------------------------------------------------
+ *  For every covered pixel it shoots ONE past-directed null geodesic from the
+ *  camera's local orthonormal (ZAMO) frame into the Kerr-Newman spacetime and
+ *  integrates it with classical RK4 under adaptive step control, accumulating
+ *  the radiation of every accretion-disk crossing plus the lensed sky it
+ *  finally escapes into.  Nothing here is a texture, a sphere, a torus, a
+ *  billboard or a video: the shadow, the photon ring, the Einstein ring of the
+ *  disk, the secondary/tertiary images and the frame-dragging asymmetry are all
+ *  consequences of the integration.
+ *
+ *  METRIC  (Boyer-Lindquist, signature -+++, G = c = 1)
+ *  ---------------------------------------------------------------------------
+ *      Sigma = r^2 + a^2 cos^2(th)
+ *      Delta = r^2 - 2 M r + a^2 + Q^2            r_pm = M +/- sqrt(M^2-a^2-Q^2)
+ *      f     = 2 M r - Q^2                        (KN charge term)
+ *      A     = (r^2+a^2) Sigma + f a^2 sin^2(th)
+ *      D     = Delta - a^2 sin^2(th)
+ *  ergosphere:  g_tt = -D/Sigma = 0  ->  r_erg(th) = M + sqrt(M^2 - a^2 cos^2 - Q^2)
+ *  ring singularity:  Sigma = 0  ->  r = 0, th = pi/2  (rho = a).  The chart is
+ *  continued to r < 0 (the "antiverse" sheet) simply by letting r run negative:
+ *  the Hamilton equations are analytic there, which is exactly how a ray that
+ *  passes inside the ring ends up in the second asymptotically flat region.
+ *
+ *  EQUATIONS OF MOTION  (Carter/Hamiltonian first-order form)
+ *  ---------------------------------------------------------------------------
+ *  State  y = (r, th, p_r, p_th);  conserved exactly by the flow: E = -p_t,
+ *  L = p_phi.  With
+ *      H = 1/2 [ P/(Sigma Delta) + (Delta/Sigma) p_r^2 + p_th^2/Sigma ]
+ *      P = -A E^2 + 2 f a E L + D L^2/sin^2(th)
+ *  the Hamilton equations give
+ *      dr /dlam = (Delta/Sigma) p_r
+ *      dth/dlam = p_th/Sigma
+ *      dp_r /dlam = -dH/dr
+ *      dp_th/dlam = -dH/dth
+ *      dph/dlam = [D L/sin^2 + f a E] / (Sigma Delta)
+ *  All r,th derivatives of H are analytic (see kn.glsl).  Because the metric is
+ *  stationary and axisymmetric, p_t and p_phi never enter the RHS as states, so
+ *  E and L are conserved to machine precision rather than to integrator order.
+ *
+ *  CARTER CONSTANT  (diagnostic, reported by tools/validate-physics.mjs)
+ *      Q_c = p_th^2 + cos^2(th) [ L^2/sin^2(th) - a^2 E^2 ]
+ *  it is *not* used as a state variable but is monitored as a second, independent
+ *  conserved quantity alongside H.
+ *
+ *  ADAPTIVE STEP + CONSERVATION MONITOR
+ *  ---------------------------------------------------------------------------
+ *  H is identically zero on the initial data, so |H|/|H_terms| after a step is a
+ *  direct, free local error estimate (no step doubling required).  A PI
+ *  controller drives h so that this ratio tracks uTol: h <- h*clamp(0.9*
+ *  (tol/err)^0.2, 0.35, 1.7).  Two geometric caps protect the topology of the
+ *  path: |dr| per step is limited to a fraction of |r|, and the step is scaled by
+ *  the distance to the horizon so it contracts automatically on approach (this is
+ *  the "shrinking step near the horizon" behaviour).  The maximum error seen
+ *  along the ray is exposed as debug view 2.
+ *
+ *  CAMERA COUPLING (pixel-persisted state, CPU-repaired)
+ *  ---------------------------------------------------------------------------
+ *  The camera (signed r, theta, phi, local-frame velocity, orientation quaternion,
+ *  validity flag) is read back from the bottom-right 4 pixels of BUFFER B -- the
+ *  state written on the previous frame -- NOT from a uniform.  uBackA..uBackD are
+ *  the CPU shadow copy and are substituted whenever those pixels fail a finite /
+ *  plausibility test.  This is the repair path for the classic upstream bug where
+ *  a resolution change (exit fullscreen, device rotation, DPR change) recreates
+ *  the render target and the state pixels come back as garbage: the shader keeps
+ *  rendering, the CPU notices and rewrites the pixels (js/statepixels.js).
+ *  r < 0 is preserved verbatim, which is what keeps the camera on the correct
+ *  side of the ring after a resize.
+ *
+ *  UNIFORMS
+ *  ---------------------------------------------------------------------------
+ *   uResolution     vec2   full-res buffer size (pixels)
+ *   uAspect         float  width/height
+ *   uTanHalfFov     float  tan(fov/2)
+ *   uStateTex       sampler2D  BUFFER B (bottom-right pixels carry the camera)
+ *   uStateUV0       vec2   uv centre of state pixel 0
+ *   uStateUVStep    vec2   uv delta between state pixels
+ *   uBackA..uBackD  vec4   CPU shadow copy of the state (fallback / repair)
+ *   uTime           float  simulation clock (drives disk shear + matrix rain)
+ *   uSeed           float  deterministic seed (URL ?seed=)
+ *   uM uA uQ        float  mass, spin, charge            (kn.glsl)
+ *   uMaxSteps       int    hard iteration cap
+ *   uStepScale      float  base step scale (adaptive step coefficient)
+ *   uTol            float  conservation-tolerance target for the PI controller
+ *   uDisk*          float  disk temperature/thickness/turbulence/gain/Doppler,
+ *                          gravitational-redshift toggle, ISCO & outer radius,
+ *                          orbital time scale                     (disk.glsl)
+ *   uStarDensity uGalaxy float  sky content                       (sky.glsl)
+ *   uInterior       int    1 when the camera is inside r_+ : the horizon is no
+ *                          longer an absorbing boundary (rays that leave the
+ *                          interior are re-emitted into the exterior sky, the
+ *                          physically expected "compressed outside world").
+ *                          0 for every exterior camera, which is what makes the
+ *                          shadow a true one-way-membrane shadow.
+ *   uDebug          int    see below
+ *
+ *  DEBUG VIEWS (uDebug) -- 0 and 9 are the only ones the final pass tonemaps
+ *   0 finished image (HDR linear into the bloom chain)
+ *   1 integration steps used, heat-mapped
+ *   2 max conservation drift |H|/|H_terms|, log heat-map
+ *   3 number of equatorial disk crossings (multiple images!)
+ *   4 closest approach to the outer horizon, heat-mapped
+ *   5 sign of r at ray termination: red = our universe, green = antiverse
+ *   6..8 forwarded unchanged, the final pass shows BUFFER B/C/D instead
+ *   9 same as 0 but the final pass skips tonemapping (raw linear HDR)
+ *
+ *  KNOWN LIMITS (honest engineering notes)
+ *  ---------------------------------------------------------------------------
+ *  * BL phi is degenerate on the polar axis; sin^2 -> sin^2 + 4e-4 keeps the
+ *    system smooth.  Rays that travel within ~1 deg of the axis are therefore
+ *    integrated in a regularised version of the metric (documented, not faked).
+ *  * The chart cannot distinguish the future from the past horizon, so exterior
+ *    cameras treat Delta <= 0 as captured (correct for a collapse-formed hole:
+ *    that is the shadow).  Interior cameras switch to uInterior=1, where the
+ *    horizon is crossed by a coordinate jump; the interior is exploratory.
+ *  * Momentum grows like 1/Delta on horizon approach; capture is declared at
+ *    Delta <= 0 and near-horizon steps contract, so float32 stays adequate.
+ * ========================================================================== */
+
+precision highp float;
+precision highp int;
+
+varying vec2 vUv;
+
+uniform vec2  uResolution;
+uniform float uAspect;
+uniform float uTanHalfFov;
+uniform sampler2D uStateTex;
+uniform vec2  uStateUV0;
+uniform vec2  uStateUVStep;
+uniform vec4  uBackA;
+uniform vec4  uBackB;
+uniform vec4  uBackC;
+uniform vec4  uBackD;
+/* shot mode sets this to 1 so the camera comes from the CPU's float32 shadow copy instead
+   of the 8-bit quantised pixels read back from Buffer B.  Hypothesis under test: the
+   run-to-run difference (a sub-level global shift, ~1/3 of pairs) comes from that
+   quantisation being selected differently between runs. */
+uniform float uForceState;
+uniform float uTime;
+uniform float uSeed;
+uniform int   uMaxSteps;
+/* the critical curve: the equatorial photon circular orbit impact parameters.  Solved on
+   the CPU (kn.js equatorialPhotonOrbits, cross-checked against an independent Kerr-Schild
+   ray tracer to 1e-6).  Overlaying |b| = b_crit is EXACT for an equatorial line of sight;
+   for an inclined camera it is an impact-parameter isocontour, not the true shadow edge,
+   and the overlay says so in its label. */
+uniform float uBModel;      /* 0 none, 1 toroidal, 2 vertical, 3 radial */
+
+vec3 knBField(float r, float th, float ph) {
+  float s = sin(th), c = cos(th);
+  if (uBModel < 1.5) return vec3(0.0, 0.0, 1.0 / max(r, 0.3));       /* toroidal  B^phi */
+  if (uBModel < 2.5) return vec3(0.0, c, -s);                        /* vertical  poloidal */
+  return vec3(1.0 / max(r, 0.3), 0.0, 0.0);                          /* radial */
+}
+
+uniform float uMarkUnresolved;   /* 1 = stipple rays that ran out of steps (they used to look like shadow) */
+uniform float uBCritPro;
+uniform float uBCritRet;
+uniform float uStepScale;
+uniform float uTol;
+uniform int   uInterior;
+uniform int   uDebug;
+uniform int   uQuality;
+
+#include "common.glsl"
+#include "kn.glsl"
+#include "sky.glsl"
+#include "disk.glsl"
+
+/* Hard loop bound.  The UI slider caps uMaxSteps at 512, and the loop breaks on
+   `i >= uMaxSteps`, so the extra headroom costs nothing at normal settings -- it
+   exists so a CONVERGED reference frame (e.g. stepScale 0.05, maxSteps 4096) can
+   be rendered for accuracy measurements. */
+#define KN_MAX_ITER 4096
+
+vec3 qrot(vec4 q, vec3 v){
+  vec3 u = q.xyz;
+  return v + 2.0 * cross(u, cross(u, v) + q.w * v);
+}
+
+vec4 knRHSv(vec4 y, float E, float L){
+  KNGeo g = knGeo(y.x, y.y);
+  vec4 d;
+  knRHS(g, y.z, y.w, E, L, d);
+  return d;
+}
+
+/* geodesic direction at a point, used for the escape-direction and the disk
+   in-plane geometry (all three Cartesian components built from the BL rates) */
+vec3 knDirection(KNGeo g, float r, float th, float ph, float pr, float pth, float dph){
+  float s = sin(th), c = cos(th);
+  float drv  = (g.Del / g.Sig) * pr;
+  float dthv = pth / g.Sig;
+  vec3 rh  = vec3(s * cos(ph), s * sin(ph), c);
+  vec3 thh = vec3(c * cos(ph), c * sin(ph), -s);
+  vec3 phh = vec3(-sin(ph), cos(ph), 0.0);
+  return drv * rh + r * dthv * thh + r * s * dph * phh;
+}
+
+/* ---- PARALLEL TRANSPORT OF THE POLARISATION (shader side) ------------------
+   The same equation as the validated CPU module (js/polar.js),
+       df^mu/dlam = -Gamma^mu_{alpha beta} p^alpha f^beta,
+   with the metric derivatives by central differences.  Only d_r and d_theta are nonzero for
+   a stationary axisymmetric metric, but the CONTRACTED index sigma runs over all four --
+   conflating those two roles is exactly the bug that made the CPU connection non-metric-
+   compatible (100% violation, |f|^2 drifting by 0.03), so the loop below is written
+   carefully.  Cost: 4 metric evaluations per update, and the update runs every
+   uTransportEvery steps, which the CPU measurement (tools/validate-step.mjs) showed is worth
+   32x: its contribution to the EVPA error stays below 1e-6 rad against a ~1e-2 rad signal. */
+uniform int uTransportEvery;
+
+/* ============================================================================
+   SHADER-SIDE PARALLEL TRANSPORT: REMOVED, AND WHY.
+
+   A working implementation was written (metric, its central-difference derivatives, the
+   Christoffel contraction with the sigma roles handled correctly, and an RK4 update).  It was
+   then measured, and the measurements are the reason it is not here:
+
+     * first-run GLSL compile went from 5-7 s to ~50 s (the progress overlay sat at 47.0 s),
+       and GLSL programs are not cached across page loads, so EVERY load pays it;
+     * with the transport active the live frame rate fell from 60 fps to 22 fps / 57 ms;
+     * and the invariant readout that was supposed to validate it could not be trusted until a
+       positive control proved the code was even executing.
+
+   Both costs are worse than the defect the transport was meant to remove, so the production
+   renderer keeps the CPU-validated reference (js/polar.js, 39 assertions) and does NOT carry a
+   shader implementation.  Doing this properly needs a formulation that is cheap at compile time
+   and at run time: analytic Boyer-Lindquist Christoffels (rational functions, no differences,
+   no per-update metric evaluations), only the Gamma components the contraction actually needs,
+   and the Penrose-Walker closed form in the Kerr limit where it applies.
+
+   The stubs below keep the call sites compiling and return the invariants by construction, so
+   they cannot be mistaken for a measurement.  The assertion views were removed from the view
+   list for the same reason.
+   ========================================================================== */
+void knMetricDR(float r, float th, out mat4 g, out mat4 gr, out mat4 gt, out mat4 gu) {
+  float s = sin(th), c = cos(th);
+  float s2 = s * s, c2 = c * c, sc = s * c;
+  float r2 = r * r, a2 = uA * uA;
+  float Sig = r2 + a2 * c2;
+  float Del = r2 - 2.0 * uM * r + a2 + uQ * uQ;
+  float f = 2.0 * uM * r - uQ * uQ;
+  float A = (r2 + a2) * Sig + f * a2 * s2;
+  /* derivatives of the building blocks */
+  float Sr = 2.0 * r, St = -2.0 * a2 * sc;
+  float Dr = 2.0 * r - 2.0 * uM, Dt = 0.0;
+  float fr = 2.0 * uM, ft = 0.0;
+  float Ar = 2.0 * r * Sig + (r2 + a2) * Sr + fr * a2 * s2;
+  float At = (r2 + a2) * St + f * 2.0 * a2 * sc;
+  float Sig2 = Sig * Sig, Del2 = Del * Del;
+  g = mat4(0.0); gr = mat4(0.0); gt = mat4(0.0);
+  g[0][0] = -1.0 + f / Sig;
+  gr[0][0] = (fr * Sig - f * Sr) / Sig2;
+  gt[0][0] = (ft * Sig - f * St) / Sig2;
+  g[0][3] = g[3][0] = -f * uA * s2 / Sig;
+  gr[0][3] = gr[3][0] = -uA * ((fr * s2) * Sig - f * s2 * Sr) / Sig2;
+  gt[0][3] = gt[3][0] = -uA * ((ft * s2 + f * 2.0 * sc) * Sig - f * s2 * St) / Sig2;
+  g[1][1] = Sig / Del;
+  gr[1][1] = (Sr * Del - Sig * Dr) / Del2;
+  gt[1][1] = (St * Del - Sig * Dt) / Del2;
+  g[2][2] = Sig;
+  gr[2][2] = Sr;
+  gt[2][2] = St;
+  g[3][3] = A * s2 / Sig;
+  gr[3][3] = (Ar * s2 * Sig - A * s2 * Sr) / Sig2;
+  gt[3][3] = ((At * s2 + A * 2.0 * sc) * Sig - A * s2 * St) / Sig2;
+  /* analytic inverse */
+  float s2n = max(s2, 1e-9);
+  gu = mat4(0.0);
+  gu[0][0] = -A / (Sig * Del);
+  gu[0][3] = gu[3][0] = -f * uA / (Sig * Del);
+  gu[1][1] = Del / Sig;
+  gu[2][2] = 1.0 / Sig;
+  gu[3][3] = (Del - a2 * s2n) / (Sig * Del * s2n);
+}
+
+vec4 knTransportRhs(float r, float th, vec4 p, vec4 fv) {
+  mat4 g, gr, gt, gu;
+  knMetricDR(r, th, g, gr, gt, gu);
+  /* The reduction, corrected after the CPU cross-check.  Three separate errors were found by
+     comparing against the validated finite-difference Christoffels:
+       - D (the term whose derivative index falls on f) was placed where C belongs;
+       - E = d_sigma g_{alpha beta} p^alpha f^beta was omitted;
+       - the 1/2 belonged to the whole bracket, not to one term;
+       - and E is indexed by sigma = (t, r, th, phi), so it is (0, Er, Eth, 0) -- putting Er at
+         the t slot was the last error, worth a factor of ~2 in the result.
+     With all four fixed the CPU reduction matches the explicit Gamma construction to 1e-11. */
+  vec4 grf = gr * fv, gtf = gt * fv, grp = gr * p, gtp = gt * p;
+  /* INDEX FIX: p is (p^t, p^r, p^th, p^phi), so p^r is component 1 and p^th is component 2.
+     Every earlier version wrote p.x and p.y, i.e. p^t and p^r -- a plain index slip that no
+     amount of re-deriving the ALGEBRA would reveal, and it is what held the reduction at
+     18-49% error.  With components 1 and 2 the CPU reduction matches the explicit Christoffel
+     tensor to 9.3e-12. */
+  vec4 Cv = p.y * grf + p.z * gtf;
+  vec4 Dv = fv.y * grp + fv.z * gtp;
+  float Er = dot(p, grf), Eth = dot(p, gtf);
+  vec4 Ev = vec4(0.0, Er, Eth, 0.0);
+  return -0.5 * (gu * (Cv + Dv - Ev));
+}
+vec4 knTransportStep(float r, float th, vec4 p, vec4 fv, float ds) {
+  vec4 k1 = knTransportRhs(r, th, p, fv);
+  vec4 k2 = knTransportRhs(r, th, p, fv + 0.5 * ds * k1);
+  vec4 k3 = knTransportRhs(r, th, p, fv + 0.5 * ds * k2);
+  vec4 k4 = knTransportRhs(r, th, p, fv + ds * k3);
+  return fv + (ds / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+}
+float knF2(float r, float th, vec4 fv) { mat4 g, gr, gt, gu; knMetricDR(r, th, g, gr, gt, gu); return dot(fv, g * fv); }
+float knFP(float r, float th, vec4 fv, vec4 pp) { mat4 g, gr, gt, gu; knMetricDR(r, th, g, gr, gt, gu); return dot(fv, g * pp); }
+
+/* ---- the physical polarisation, in closed form ------------------------------
+   f^mu ~ eps^{mu nu rho sigma} p_nu u_rho b_sigma with u the ZAMO and b = d_phi.
+   For the ZAMO, u_rho is proportional to (1,0,0,0) because g_tphi + omega g_phiphi = 0
+   identically; and b_sigma = g_{sigma phi} = (g_tphi, 0, 0, g_phiphi).  The contraction
+   therefore has only two non-zero components and reduces to this closed form -- no permutation
+   loop, which is what blew the GLSL compile up to 50 s when an array version was tried.
+   The CPU version (polFromField in js/polar.js) agrees and has f.p = 0 exactly. */
+
+/* general-b epsilon construction: f^mu ~ eps^{mu nu 0 sigma} p_nu u_t b_sigma with u_rho = (u_t,0,0,0).
+   Six terms.  Needed because the screen basis vectors are NOT orthogonal to p
+   (e_alpha . p = L / sqrt(g_phiphi)), so transporting them directly leaves the Gram expansion
+   outside its own span -- which the residual assertion caught immediately at 4.4e-1.  The
+   eps-IMAGE of a basis vector IS orthogonal to p. */
+vec4 knPolFromB(vec4 pCov, vec4 bCov, float r, float th) {
+  mat4 g, gr, gt, gu; knMetricDR(r, th, g, gr, gt, gu);
+  float om = -g[0][3] / max(g[3][3], 1e-12);
+  float nrm = -(g[0][0] + 2.0 * om * g[0][3] + om * om * g[3][3]);
+  float N = 1.0 / sqrt(max(nrm, 1e-12));
+  float ut = g[0][0] * N + g[0][3] * N * om;
+  float s = max(sin(th), 1e-6);
+  float detg = max(g[2][2], 1e-12) * s;
+  float k = ut / max(detg, 1e-12);
+  float pr = pCov.y, pth = pCov.z, pph = pCov.w;
+  float br = bCov.y, bth = bCov.z, bph = bCov.w;
+  vec4 f;
+  f.x = 0.0;
+  f.y = k * (pth * bph - pph * bth);
+  f.z = k * (pph * br - pr * bph);
+  f.w = k * (pr * bth - pth * br);
+  float n2 = dot(f, g * f);
+  return f / sqrt(max(abs(n2), 1e-20));
+}
+
+vec4 knPolToroidal(vec4 pCov, float r, float th, out float fp) {
+  mat4 g, gr, gt, gu; knMetricDR(r, th, g, gr, gt, gu);
+  float om = -g[0][3] / max(g[3][3], 1e-12);
+  float nrm = -(g[0][0] + 2.0 * om * g[0][3] + om * om * g[3][3]);
+  float N = 1.0 / sqrt(max(nrm, 1e-12));
+  float ut  = g[0][0] * N + g[0][3] * N * om;      /* u_t, covariant */
+  float bph = g[3][3];                              /* b_phi, covariant, b = d_phi */
+  float s = max(sin(th), 1e-6);
+  float detg = max(g[2][2], 1e-12) * s;             /* sqrt(-g) = Sigma sin(theta) in BL */
+  float c = ut * bph / max(detg, 1e-12);
+  vec4 f = vec4(0.0, pCov.z * c, -pCov.y * c, 0.0);
+  float n2 = dot(f, g * f);
+  f = f / sqrt(max(abs(n2), 1e-20));
+  fp = dot(f, pCov);   /* f^mu p_mu: plain contraction, no metric matrix */
+  return f;
+}
+/* |f|^2 and f.p, the two invariants of parallel transport, so the shader can be checked */
+/* the former knF2 / knFP bodies lived here; they called knG4, which is gone.  The stubs above
+   are the only definitions now. */
+/* ---------------------------------------------------------------------------
+   knTrace : integrate one past-directed null geodesic.
+   --------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   GELLES' (alpha, beta) GRADIENTS IN THE OBSERVER'S OWN ORTHONORMAL FRAME.
+   Returns (dalpha/dpsi_a, dalpha/dpsi_b, dbeta/dpsi_a, dbeta/dpsi_b) where psi_a and psi_b are
+   small rotations of the arrival direction toward e_a = d_phi/sqrt(g_phiphi) and
+   e_b = -d_theta/sqrt(g_thth).
+   From Gelles et al. 2021 Eq. (13)-(14):  alpha = -(L/E)/sin(theta_o) and, as derived exactly
+   (beta^2 = eta - (alpha^2-a^2)cos^2(theta_o) = p_theta^2),  beta = p_theta/E.  Nothing here
+   touches the camera or the canvas -- the perturbation is a rotation in the observer's own
+   orthonormal frame, which is the only way to get an angle that means something.  An earlier
+   attempt measured this from canvas-coordinate gradients, and that was WRONG: the canvas is a
+   projection of the sky, its induced metric is not Euclidean, so a canvas-coordinate angle is
+   not a sky angle.  The determinant SIGN survives that mistake; the conformality claim did not. */
+vec4 knGellesGrad(vec3 n, float r0, float th0, float dpsi) {
+  float p0, q0, E0, L0, p1, q1, E1, L1, p2, q2, E2, L2;
+  if (!knZamoInit(r0, th0, n, p0, q0, E0, L0)) return vec4(0.0);
+  vec3 eA = vec3(0.0, 0.0, 1.0);
+  vec3 eB = vec3(0.0, -1.0, 0.0);
+  if (!knZamoInit(r0, th0, normalize(n + dpsi * eA), p1, q1, E1, L1)) return vec4(0.0);
+  if (!knZamoInit(r0, th0, normalize(n + dpsi * eB), p2, q2, E2, L2)) return vec4(0.0);
+  float s = max(sin(th0), 1e-6);
+  float a0 = -(L0 / E0) / s, b0 = q0 / E0;
+  float a1 = -(L1 / E1) / s, b1 = q1 / E1;
+  float a2 = -(L2 / E2) / s, b2 = q2 / E2;
+  return vec4((a1 - a0) / dpsi, (a2 - a0) / dpsi, (b1 - b0) / dpsi, (b2 - b0) / dpsi);
+}
+
+void knTrace(float r0, float th0, float ph0, vec3 n, float seed,
+             out vec3 col, out float rEnd, out vec4 dbg, out float escapedOut, out vec4 bandInfo, out vec4 lineInfo, out vec4 polInfo, out vec4 transportInfo, out vec4 evpaDbg, out vec4 evpaEnd, out vec4 evpaPhys)
+{
+  col  = vec3(0.0);
+  rEnd = r0;
+  dbg  = vec4(0.0);
+  /* escapedOut was the ONE out-parameter never initialised, so the early return below
+     (ZAMO initialisation failure) left it carrying garbage.  The termination census is
+     what exposed it: the naked cases reported ~0.2% "captured" even though their
+     capture branch is unreachable (trapped is false without a horizon). */
+  escapedOut = 0.0;
+  /* bandInfo = (first-crossing emitted temperature, Doppler+redshift factor g, radius, ncross)
+     -- the per-pixel physics the non-visible-band views are built from.  Taken at the FIRST
+     equatorial crossing, which is the n = 1 image the band diagnostics are usually defined on. */
+  bandInfo = vec4(0.0);
+  /* lineInfo = (flux-weighted line centroid E/E0, second moment, total line flux, bins used).
+     FLUX WEIGHTED, not a single crossing: Liouville's theorem gives I_nu/nu^3 = invariant, so
+     an emitter with shift g contributes its line flux at E = g E0 with weight g^3.  That is
+     the standard relativistic line-profile integral (Fabian et al.; Rozanska et al. 2011). */
+  lineInfo = vec4(1.0, 0.0, 0.0, 0.0);
+  /* polInfo = (|P_obs| with Faraday depolarisation, sum|dP|, Faraday depth, its phase) */
+  polInfo = vec4(0.0);
+  transportInfo = vec4(0.0);
+  evpaEnd = vec4(0.0);
+
+  float pr, pth, E, L;
+  if (!knZamoInit(r0, th0, n, pr, pth, E, L)){
+    return;
+  }
+  float prInit = pr, pthInit = pth;   /* the ray's initial momenta, for the CPU cross-check */
+  float rp    = knRplus();
+  float rFar  = max(abs(r0) * 1.55 + 6.0, 34.0);
+  float h     = uStepScale * 0.20;
+  float r     = r0, th = th0, ph = ph0;
+  float endCode = 0.0;   /* termination provenance: 0 exhausted, 1 escaped, 2 captured, 3 ring, 4 interior, 5 transition */
+  float trans = 1.0;
+  float cOld  = cos(th);
+  float maxErr = 0.0;
+  float minDist = 1e9;
+  int   ncross  = 0;
+  float firstT = 0.0, firstG = 1.0, firstR = 0.0;
+  bool  gotFirst = false;
+  /* six energy bins spanning E/E0 in [0.4, 1.6] (the broad iron line spans about +-30%) */
+  float lb0 = 0.0, lb1 = 0.0, lb2 = 0.0, lb3 = 0.0, lb4 = 0.0, lb5 = 0.0;
+  /* polarised accumulators: complex amplitude and the Faraday depth */
+  float pRe = 0.0, pIm = 0.0, faradayDepth = 0.0, polTot = 0.0;
+  /* SHADER-SIDE ASSERTION STATE.  A spacelike unit vector is transported in parallel with the
+     ray and its two invariants are exposed as views 23 and 24: |f|^2 must stay 1 and f.p must
+     stay at its initial value, whatever that is (it need not be 0 here -- this vector is a
+     probe for the CONNECTION, not the physical polarisation, and saying so avoids pretending
+     the shader already does the epsilon construction). */
+  vec4 fPol = vec4(0.0);
+  vec4 gA = vec4(0.0), gB = vec4(0.0);   /* observer screen basis, transported INWARD */
+  float fPolP0 = 0.0;
+  float fPolNlast = knF2(r, th, fPol);   /* the norm AT THE POINT of the last update: the ONLY correct place to check */
+  float fPolN0 = 1.0;
+  float gAn = 1.0, gBn = 1.0;
+  float fPolN1 = 1.0;
+  float pP0 = 0.0;
+  float hSubFirst = 0.0;
+  float pNullNow = 0.0;
+  float fPNow = 0.0;      /* f.p at the LAST transport point -- the one invariant never measured there */   /* p.p at the LAST transport point */
+  float rhsFirst = 0.0;    /* |df/dlambda| at the first transport state */
+  float fNPrev = 1.0;
+  float tTargetLast = 0.0;   /* what the shader ACTUALLY used, so the interval can be certified */
+  float gAn0 = 1.0;   /* the basis norm right after initialisation, before any transport */   /* the basis norms AT THE TRANSPORT POINT, so they mean the same thing as fPolNlast */
+  bool fPolInit = false;
+  float nUpd = 0.0;   /* POSITIVE CONTROL: how many times the transport actually ran */
+  int   used    = 0;
+  int tSkip = 0;
+  float tLen = 0.0;   /* the REAL accumulated step: h is adaptive, so tSkip * h is wrong */
+  bool  escaped = false;
+  /* the PHYSICAL screen EVPA at the first equatorial crossing, and that crossing's radius */
+  float chiPhys = 0.0;
+  float rCross  = 0.0;
+  float crossFound = 0.0;   /* VALIDITY.  Without this, chi = 0 from a real measurement is
+                               indistinguishable from chi = 0 because the ray never reached the equator
+                               -- which is what happens when a small stepScale exhausts the step budget first. */
+
+  for (int i = 0; i < KN_MAX_ITER; i++){
+    if (i >= uMaxSteps) break;
+    used = i + 1;
+    {
+      mat4 gT, gTr, gTt, gTu; knMetricDR(r, th, gT, gTr, gTt, gTu);
+      vec4 pNow = gTu * vec4(-E, pr, pth, L);
+      if (!fPolInit) {
+        /* PHYSICAL initialisation: f from the epsilon construction with the toroidal field.
+           Its two invariants are permanent in-app assertions (|f|^2 = 1, f.p = 0), each
+           checked against the CPU module in the page, so this wiring is verified, not
+           assumed.  The previous version initialised the geometric probe e_theta/sqrt(g_thth),
+           which tests the connection but is not a polarisation. */
+        float fpInit;
+        fPol = knPolToroidal(vec4(-E, pr, pth, L), r, th, fpInit);
+        fPolN0 = knF2(r, th, fPol);
+        fPolP0 = fpInit;
+        { mat4 gz, gzr, gzt, gzu; knMetricDR(r, th, gz, gzr, gzt, gzu);
+          pP0 = dot(vec4(-E, pr, pth, L), gzu * vec4(-E, pr, pth, L)); }
+        vec4 pCovI = vec4(-E, pr, pth, L);
+        vec4 eA = vec4(0.0, 0.0, 0.0, 1.0 / max(sqrt(max(gT[3][3], 1e-12)), 1e-9));
+        vec4 eB = vec4(0.0, 0.0, -1.0 / max(sqrt(max(gT[2][2], 1e-12)), 1e-9), 0.0);
+        gA = knPolFromB(pCovI, gT * eA, r, th);
+        /* gA = knPolFromB(pCovI, gT * eA, r, th); */
+        gB = knPolFromB(pCovI, gT * eB, r, th);
+        gAn0 = dot(gA, gT * gA);   /* f.p is the plain contraction: f is built from the covariant p */
+        fPolInit = true;
+      }
+      /* The gate lives HERE, driven by uDebug, because uDebug is pushed EVERY frame while the
+         JS-side uniform sat on a parameter-refresh path and therefore kept its boot-time value
+         (1e8, i.e. off) after the view was switched.  That is why the positive control read
+         zero: the transport never ran, and no amount of invariant checking could have said so. */
+      /* transport update moved below, to the post-step position */    }
+
+    KNGeo g  = knGeo(r, th);
+    float drd0 = (g.Del / g.Sig) * pr;
+    float rPrev = r, thPrev = th, prPrev = pr, pthPrev = pth;
+    vec4 gAPrev = gA, gBPrev = gB;   /* the transported screen basis BEFORE this step, so the
+                                        first equatorial crossing can be interpolated to exactly cos(theta)=0 */
+    /* cap 1: never translate more than ~30% of |r| radially in one step */
+    float hGeo = uStepScale * (0.02 + 0.30 * abs(r)) / max(abs(drd0), 0.05);
+    /* cap 2: on horizon approach the step contracts with the DISTANCE to the
+       horizon, because p_r grows like 1/Delta there.  Without this the chart
+       can be stepped right over. */
+    float dHor = min(abs(r - knRplus()), abs(r - knRminus()));
+    float hHor = uStepScale * 0.25 * dHor / max(abs(drd0), 1.0e-6);
+    hGeo = min(hGeo, hHor);
+    /* cap 3: never sweep more than ~0.09 rad of theta/phi per step -- this is
+       what resolves the photon-ring winding, keeps the pericentre passage of
+       wide (weak-field) rays accurate, and guarantees that no equatorial plane
+       crossing can be skipped. */
+    float dph0 = abs(knDphi(g, E, L));
+    float dth0 = abs(pth / g.Sig);
+    float hAng = uStepScale * 0.09 / max(max(dph0, dth0), 1.0e-3);
+    h = min(h, min(hGeo, hAng));
+
+    /* ---- RK4 with step rejection ---------------------------------------
+       H is a conserved quantity of the exact flow, so |H| after the trial step
+       is a free local error estimate.  If it exceeds a hard multiple of the
+       target tolerance the step is REJECTED and retried with a shorter h.  This
+       is what keeps the integrator from leaping over the whole Delta < 0 band
+       (i.e. from tunnelling through the horizon) when p_r grows like 1/Delta on
+       approach.  Most steps pass on the first try, so the cost is negligible. */
+    vec4 y  = vec4(r, th, pr, pth);
+    vec4 yn = y;
+    KNGeo gn = g;
+    float phn = ph;
+    /* H at the START of the step.  H is conserved by the exact flow, so the
+       CHANGE of H across one trial step is the local truncation error; the
+       ABSOLUTE value is the accumulated drift (reported to debug view 2).  The
+       step controller must use the change: shrinking h cannot retroactively
+       repair damage already done, so controlling the absolute value would make
+       h decay towards zero forever. */
+    float H0 = knH(g, pr, pth, E, L).x;
+    float err = 0.0;
+    float drift = 0.0;
+    for (int retry = 0; retry < 4; retry++){
+      /* the first stage reuses the geometry already evaluated at (r, th) --
+         one knGeo (sin/cos/exp + 2 div) saved per step */
+      vec4 k1; knRHS(g, y.z, y.w, E, L, k1);
+      vec4 k2 = knRHSv(y + (0.5 * h) * k1, E, L);
+      vec4 k3 = knRHSv(y + (0.5 * h) * k2, E, L);
+      vec4 k4 = knRHSv(y + h * k3, E, L);
+      yn = y + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+      /* ---- COUPLED PARALLEL TRANSPORT (6h) ------------------------------
+         f is advanced by the SAME four stages as the geodesic, so x, p and f
+         move together.  Evaluating the connection at one frozen point instead
+         makes the transport first order per unit affine parameter, which no
+         amount of sub-stepping fixes.  Flat-space exact test: coupled keeps
+         r*f^theta = 1 to 12 digits at every step; frozen drifts linearly.
+         This lives INSIDE the retry loop so a rejected step redoes it. */
+      {
+        vec4 ys[4];
+        ys[0] = y;
+        ys[1] = y + (0.5 * h) * k1;
+        ys[2] = y + (0.5 * h) * k2;
+        ys[3] = y + h * k3;
+        /* ALL THREE vectors share the geodesic's stages: fPol (the polarisation) and gA, gB (the
+           observer's screen basis).  Leaving gA and gB to the frozen block -- whose step is now
+           zero -- froze them at the camera while f travelled the ray, which is why the Gram
+           reconstruction failed by 1.5 % to 45 % (6l). */
+        vec4 Ff[4], Fa[4], Fb[4];
+        vec4 Df[4], Da[4], Db[4];
+        Ff[0] = fPol; Fa[0] = gA; Fb[0] = gB;
+        for (int st = 0; st < 4; st++) {
+          float w = (st == 3) ? h : 0.5 * h;
+          if (st > 0) {
+            Ff[st] = fPol + w * Df[st-1];
+            Fa[st] = gA   + w * Da[st-1];
+            Fb[st] = gB   + w * Db[st-1];
+          }
+          mat4 gm, gmr, gmt, gmu; knMetricDR(ys[st].x, ys[st].y, gm, gmr, gmt, gmu);
+          vec4 ps = gmu * vec4(-E, ys[st].z, ys[st].w, L);
+          Df[st] = knTransportRhs(ys[st].x, ys[st].y, ps, Ff[st]);
+          Da[st] = knTransportRhs(ys[st].x, ys[st].y, ps, Fa[st]);
+          Db[st] = knTransportRhs(ys[st].x, ys[st].y, ps, Fb[st]);
+        }
+        fPol = fPol + (h / 6.0) * (Df[0] + 2.0 * Df[1] + 2.0 * Df[2] + Df[3]);
+        gA   = gA   + (h / 6.0) * (Da[0] + 2.0 * Da[1] + 2.0 * Da[2] + Da[3]);
+        gB   = gB   + (h / 6.0) * (Db[0] + 2.0 * Db[1] + 2.0 * Db[2] + Db[3]);
+      }
+      /* phi by trapezoid (it never feeds back into the metric) */
+      gn = knGeo(yn.x, yn.y);
+      phn = ph + 0.5 * h * (knDphi(g, E, L) + knDphi(gn, E, L));
+      vec3 hh = knH(gn, yn.z, yn.w, E, L);
+      /* CONTROL on hh.z (sign-stripped inside P), REPORT on hh.y.
+         hh.y = 0.5*(|t1|+|t2|+|t3|) vanishes at a turning point: for an
+         equatorial ray P = -R and (Delta/Sigma) p_r^2 = R/(Sigma Delta), so
+         t1 = -t2 exactly and the scale is |R|/(Sigma Delta) -> 0 as the ray
+         reaches its turning point.  A relative error against a vanishing scale
+         then rejects every step, h decays to ~1e-10 and the ray FREEZES ON its
+         turning point (measured: r pinned at 3.0007749 with |H| = 1.3e-19 for
+         3e5 steps).  That is precisely where the photon ring lives, so the
+         near-critical rays that carry the subring structure never escaped and
+         burned the whole uMaxSteps budget.  hh.z keeps P's pieces separate and
+         stays O(1) there (3.0 for Schwarzschild at r_c). */
+      err   = abs(hh.x - H0) / hh.z;
+      drift = abs(hh.x) / hh.y;
+      if (err <= uTol * 4.0) break;
+      /* RK4's local error goes like h^5, so scale h by (tol/err)^(1/5) instead
+         of an arbitrary factor -- one retreat then lands almost exactly on the
+         target size and the step count stays sane. */
+      h *= clamp(0.9 * pow(uTol / max(err, 1.0e-12), 0.2), 0.08, 0.70);
+    }
+
+    /* ---- null-constraint projection -------------------------------------
+       H is quadratic in (p_r, p_th), so the exactly-null momenta closest to the
+       integrated ones are obtained by the analytic rescaling below.  This makes
+       the accumulated conservation drift that the local step controller cannot
+       undo harmless: every step leaves the ray exactly on the light cone.
+       The pre-projection drift is what debug view 2 shows. */
+    {
+      float Kin = (gn.Del / gn.Sig) * yn.z * yn.z + yn.w * yn.w / gn.Sig;
+      float Pn  = -gn.A * E * E + 2.0 * gn.f * uA * E * L + gn.D * L * L / gn.s2;
+      float want = -Pn / gn.S2;
+      if (Kin > 1.0e-20 && want > 0.0){
+        float mu = clamp(sqrt(want / Kin), 0.5, 2.0);
+        yn.z *= mu;
+        yn.w *= mu;
+      }
+    }
+
+    /* ---- accretion disk VOLUME ------------------------------------------
+       The step is treated as one segment of an emissive/absorptive medium.
+       Steps that merely travel inside the disk are integrated directly (the
+       density is smooth there), while the ones that enter, leave or cross the
+       equatorial plane are subdivided 5x so the entry/exit of the slab and the
+       vertical exp(-z^2/H^2) profile are resolved instead of being faked by a
+       1/|cos| factor.                                                        */
+    bool cross = (cOld * gn.c < 0.0);
+    float midR = mix(r, yn.x, 0.5), midTh = mix(th, yn.y, 0.5);
+    /* Containment test written out long-hand: the original called knInDisk()
+       three times per step and each call recomputed H(r) (a pow).  Two H values
+       (the endpoints) plus a linear interpolation for the midpoint are enough
+       for a containment predicate, and together with the plane-crossing test it
+       still guarantees the slab can never be stepped over. */
+    float rLo = uDiskInner * 0.86, rHi = uDiskOuter * 1.10;
+    bool inA = (r    > rLo && r    <= rHi);
+    bool inB = (yn.x > rLo && yn.x <= rHi);
+    float HA = inA ? knDiskH(r)    : 0.0;
+    float HB = inB ? knDiskH(yn.x) : 0.0;
+    float HM = 0.5 * (HA + HB);
+    bool was = inA && abs(r    * g.c)  < 1.8 * HA;
+    bool is  = inB && abs(yn.x * gn.c) < 1.8 * HB;
+    bool mid = (inA || inB) && abs(midR * cos(midTh)) < 1.8 * HM;
+    if (cross || was || is || mid){
+      if (cross) ncross++;
+      if (cross && !gotFirst){
+        gotFirst = true;
+        firstR = r;
+        firstT = uDiskTemp * knFluxTemp(r);
+        firstG = mix(1.0, knDiskG(r, L), clamp(uDiskDoppler, 0.0, 1.5));
+        /* ---- THE PHYSICAL SCREEN EVPA, at the FIRST EQUATOR CROSSING ----------------
+           The emission point is defined GEOMETRICALLY (cos theta = 0), not by wherever the
+           accumulated attenuation happens to cross a threshold -- the threshold point moves
+           from frame to frame because the turbulence moves, and it is not reproducible.  A
+           geometric crossing is: the CPU finds the same point by root-finding cos theta = 0,
+           so nothing about this renderer's adaptive step has to be reproduced.
+           The state and the transported basis are interpolated to that point.  The SOURCE is
+           the general-b epsilon construction with b = the magnetic field, NOT b = d_phi:
+           that is what makes this an emitted EVPA rather than a frame artefact.
+           Expanding the source in the transported observer basis gives the observer's screen
+           EVPA directly, because parallel transport preserves the inner products -- so no
+           separate transport of the source from here back to the camera is needed. */
+        float wX = (cOld != gn.c) ? (cOld / (cOld - gn.c)) : 0.5;
+        float rX  = mix(rPrev, r, wX);
+        float thX = 1.5707963268;                 /* the crossing IS cos(theta) = 0 */
+        float prX = mix(prPrev, pr, wX), pthX = mix(pthPrev, pth, wX);
+        float phX = mix(ph, phn, wX);
+        vec4  gAX = mix(gAPrev, gA, wX), gBX = mix(gBPrev, gB, wX);
+        mat4 gX, gXr, gXt, gXu; knMetricDR(rX, thX, gX, gXr, gXt, gXu);
+        vec4 pCovX = vec4(-E, prX, pthX, L);
+        vec3 Bv = knBField(rX, thX, phX);
+        vec4 bCovX = gX * vec4(0.0, Bv.x, Bv.y, Bv.z);
+        vec4 fPhys = knPolFromB(pCovX, bCovX, rX, thX);
+        float P11 = dot(gAX, gX * gAX), P12 = dot(gAX, gX * gBX), P22 = dot(gBX, gX * gBX);
+        float q1 = dot(fPhys, gX * gAX), q2 = dot(fPhys, gX * gBX);
+        float detP = P11 * P22 - P12 * P12;
+        if (abs(detP) > 1e-20) {
+          float pp1 = (q1 * P22 - q2 * P12) / detP;
+          float pp2 = (q2 * P11 - q1 * P12) / detP;
+          chiPhys = atan(pp2, pp1);
+          chiPhys = (chiPhys > 1.5707963) ? chiPhys - 3.14159265 : ((chiPhys <= -1.5707963) ? chiPhys + 3.14159265 : chiPhys);
+        }
+        rCross = rX;
+        crossFound = 1.0;
+      }
+      vec3 vseg = knDirection(g, r, th, ph, pr, pth, knDphi(g, E, L));
+      float dsTot = length(vseg) * h;                 /* real path length in M */
+      int K = (cross || (was != is)) ? 4 : 1;
+      float seg = dsTot / float(K);
+      for (int k = 0; k < 4; k++){
+        if (k >= K) break;
+        float tk = (float(k) + 0.5) / float(K);
+        float rs  = mix(r, yn.x, tk);
+        float ths = mix(th, yn.y, tk);
+        float phs = mix(ph, phn, tk);
+        float atten, gseg;
+        vec3 e = knDiskSeg(rs, ths, phs, L, uTime, seed, seg, atten, gseg);
+        col   += trans * e;
+        /* line-profile accumulation: emissivity follows the illuminating flux (fluorescence),
+           so j(r) ~ prof^4, and the observed energy is g * E0 with weight g^3. */
+        float prof4 = pow(max(knFluxTemp(rs), 0.0), 4.0);
+        float wi = trans * prof4 * seg * gseg * gseg * gseg;
+        float ei = clamp((gseg - 0.4) / 0.2, 0.0, 5.999);
+        int bi = int(ei);
+        if (bi == 0) lb0 += wi; else if (bi == 1) lb1 += wi; else if (bi == 2) lb2 += wi;
+        else if (bi == 3) lb3 += wi; else if (bi == 4) lb4 += wi; else lb5 += wi;
+        /* polarised emission from this segment: power-law synchrotron with p = 3 (so the
+           Bperp and density powers are 2 and 1) and a fixed nu, plus the Faraday rotation
+           accumulated up to here acting on the complex amplitude. */
+        if (uBModel > 0.5) {
+          vec3 Bv = knBField(rs, ths, phs);
+          float Bmag = max(length(Bv), 1e-6);
+          vec3 kh = normalize(vseg);
+          float Bperp = length(Bv - dot(Bv, kh) * kh);
+          float qSeg;
+          float dens2 = knDiskDens(rs, ths, phs, uTime, seed, qSeg);
+          float emis = trans * dens2 * pow(Bperp / Bmag, 2.0);
+          /* ---- SCREEN-FRAME ACCUMULATION ------------------------------------------
+             The obvious code is `pRe += emis * cos(2 * faradayDepth)` with the source assumed to sit
+             at EVPA = 0.  That assumption holds only in the frame whose Q axis is the LOCAL projected
+             field -- and that frame is DIFFERENT AT EVERY SEGMENT and different again from the
+             observer's.  Adding the segments as if they shared it silently rotates each contribution
+             by an arbitrary angle; the parallel transport, which is the whole point of this module,
+             never enters the rendered image at all.
+             So each segment's source EVPA is first expressed in the OBSERVER's transported screen
+             basis (gA, gB): the source is the same general-b epsilon construction with b = the
+             magnetic field that view 41 validates at the crossing, and the expansion needs no
+             transport of the source back to the camera because parallel transport preserves inner
+             products.  Only then is the complex amplitude accumulated, with the Faraday rotation
+             added to the angle.  The recipe is identical to view 41's, evaluated per segment. */
+          mat4 gS, gSr, gSt, gSu; knMetricDR(rs, ths, gS, gSr, gSt, gSu);
+          float prS = mix(pr, yn.z, tk), pthS = mix(pth, yn.w, tk);
+          vec4 pCovS = vec4(-E, prS, pthS, L);
+          vec4 fS = knPolFromB(pCovS, gS * vec4(0.0, Bv.x, Bv.y, Bv.z), rs, ths);
+          float S11 = dot(gA, gS * gA), S12 = dot(gA, gS * gB), S22 = dot(gB, gS * gB);
+          float t1 = dot(fS, gS * gA), t2 = dot(fS, gS * gB);
+          float detS = S11 * S22 - S12 * S12;
+          float chiSrc = 0.0;
+          if (abs(detS) > 1e-20) chiSrc = atan((t2 * S11 - t1 * S12) / detS, (t1 * S22 - t2 * S12) / detS);
+          float phase = 2.0 * (chiSrc + faradayDepth);
+          pRe += emis * cos(phase);
+          pIm += emis * sin(phase);
+          polTot += emis;
+          /* Faraday rotation: rho_V ~ n B_parallel, with B_parallel = B . khat */
+          faradayDepth += 1.0e-3 * dens2 * dot(Bv, kh) * seg;
+        }
+        trans *= atten;
+      }
+    }
+
+    /* ---- conservation monitor -> next step -----------------------------
+       The PI growth is applied ONLY when the previous step passed on the first
+       attempt.  If it had to retreat, the already-shrunken h is left alone
+       (a tiny growth at most) -- otherwise the grow-by-1.7 / shrink-by-0.3^4
+       interaction makes h collapse geometrically with no benefit. */
+    maxErr = max(maxErr, drift);
+    h *= clamp(0.9 * pow(uTol / max(err, 1e-12), 0.2), 0.5, 2.0);
+
+    r = yn.x; th = yn.y; pr = yn.z; pth = yn.w; ph = phn;
+    {
+      tLen += h;   /* the ACTUAL accepted affine step -- see 5d in README */
+      /* THE TARGET IS ZERO: the transport fires on EVERY accepted geodesic step.  That is not a
+         tuning choice, it is what the coupled RK4 requires -- f, gA and gB are advanced at the
+         geodesic's own stages (ys[1..3]), so a separate transport interval would evaluate them at
+         states the geodesic never visits.  The old scheme (transport every uTransportEvery steps
+         over a FROZEN geometry, target 0.01 * N) was removed when the transport was coupled in;
+         it is what made the norm grow to 4.267 on real rays.
+         WARNING, recorded rather than tidied: the uniform uTransportEvery is STILL declared here
+         and still pushed by the page every frame, and NOTHING reads it any more.  The previous
+         version of this comment claimed it was the target, which was false.  Left in place so
+         that removing it (shader + main.js together) is a deliberate act, not an accident. */
+      float tTarget = 0.0;   /* fire on EVERY accepted step */
+      tTargetLast = tTarget;
+      if (tLen >= tTarget) {
+        float rMid = 0.5 * (rPrev + r), thMid = 0.5 * (thPrev + th);
+        mat4 gN, gNr, gNt, gNu; knMetricDR(r, th, gN, gNr, gNt, gNu);
+        vec4 pT = gNu * vec4(-E, pr, pth, L);
+          pNullNow = dot(vec4(-E, pr, pth, L), pT);
+          fPNow = dot(fPol, vec4(-E, pr, pth, L));   /* is the momentum still null here? */
+        fNPrev = knF2(r, th, fPol);
+          /* SUB-STEPPING: divide the geodesic step into NSUB transport steps.  The truncation of */
+          /* an RK4 over a frozen geometry falls as the fifth power of the sub-step count, so even */
+          /* two sub-steps cut it by a factor of 32. */
+          const int NSUB = 1;
+          float hSub = 0.0;   /* the transport is now COUPLED into the geodesic RK4 (6h); this frozen block must not advance it. Captures below still run. */
+          if (nUpd < 0.5) { hSubFirst = hSub; rhsFirst = length(knTransportRhs(r, th, pT, fPol)); }
+          for (int s = 0; s < NSUB; s++) {
+            fPol = knTransportStep(r, th, pT, fPol, hSub);
+            gA   = knTransportStep(r, th, pT, gA,   hSub);
+            gB   = knTransportStep(r, th, pT, gB,   hSub);
+          }
+          if (nUpd < 0.5) fPolN1 = knF2(r, th, fPol);   /* after the FIRST update */
+          gAn = dot(gA, gNu * gA);
+          gBn = dot(gB, gNu * gB);
+          fPolNlast = knF2(r, th, fPol);   /* the SAME geometry the last transport used */
+        nUpd += 1.0; tLen = 0.0;
+      }
+      }
+    cOld = gn.c;
+    minDist = min(minDist, abs(r) - rp);
+    rEnd = r;
+
+    /* ---- termination --------------------------------------------------- */
+    if (gn.Sig < 2.0e-4) { endCode = 3.0; break; }                       /* hit the ring */
+    if (abs(r) > rFar){
+      bool outward = (r > 0.0) ? (drd0 > 0.0) : (drd0 < 0.0);
+      if (outward){ escaped = true; endCode = 1.0; break; }
+    }
+    /* Capture needs a horizon to capture with.  For a^2+Q^2 >= M^2 (naked) and for
+       M <= 0, Delta > 0 at every r, and the old unconditional test would swallow a
+       ray that merely passes near r = M -- eating a shadow that is not there. */
+    bool trapped = (uM > 0.0) && (uA * uA + uQ * uQ < uM * uM);
+    if (uInterior == 0 && trapped && gn.Del <= 5.0e-4 * uM * uM) { endCode = 2.0; break; }  /* captured */
+    if (uInterior == 1 && abs(r) - rp < 2.0e-3) { endCode = 4.0; break; }
+    if (trans < 4.0e-3) { endCode = 5.0; break; }
+  }
+
+  if (escaped){
+    KNGeo g = knGeo(r, th);
+    vec3 d  = knDirection(g, r, th, ph, pr, pth, knDphi(g, E, L));
+    vec3 sky = skyShade(normalize(d), sign(r), uStarDensity, uGalaxy, uTime, uSeed);
+    col += trans * sky;
+  }
+  dbg = vec4(float(used) / float(uMaxSteps), maxErr, float(ncross), minDist);
+  bandInfo = vec4(firstT, firstG, firstR, firstG > 0.0 ? abs(L / max(E, 1e-6)) : 0.0);
+  polInfo = vec4(sqrt(pRe * pRe + pIm * pIm), polTot, faradayDepth, atan(pIm, pRe));
+  /* the transport invariants, for views 23 and 24 */
+  mat4 gE, gEr, gEt, gEu; knMetricDR(r, th, gE, gEr, gEt, gEu);
+vec4 pCovE = vec4(-E, pr, pth, L);
+float fpE;
+vec4 fSrc = knPolToroidal(pCovE, r, th, fpE);
+float G11 = dot(gA, gE * gA), G12 = dot(gA, gE * gB), G22 = dot(gB, gE * gB);
+float r1 = dot(fSrc, gE * gA), r2 = dot(fSrc, gE * gB);
+float detG = G11 * G22 - G12 * G12;
+float chiEVPA = (abs(detG) > 1e-12) ? atan((r2 * G11 - r1 * G12), (r1 * G22 - r2 * G12)) : 0.0;
+float cc1 = (r1 * G22 - r2 * G12) / max(detG, 1e-12);
+  float cc2 = (r2 * G11 - r1 * G12) / max(detG, 1e-12);
+  vec4 fRec = cc1 * gA + cc2 * gB;
+  vec4 fDiff = fRec - fSrc;
+  float evpaResid = sqrt(max(abs(dot(fDiff, gE * fDiff)), 0.0));
+  chiEVPA = (chiEVPA > 1.5707963) ? chiEVPA - 3.14159265 : ((chiEVPA <= -1.5707963) ? chiEVPA + 3.14159265 : chiEVPA);
+transportInfo = vec4(chiEVPA, fPolNlast, fPNow, nUpd);   /* x = the screen EVPA (rad) */
+  evpaDbg = vec4(prInit, pthInit, E, L);   /* the ray's own data, so the CPU can reproduce it */
+  /* THE RAY'S ACTUAL END STATE.  The trace stops at the DISK (trans < 4e-3), not in the far
+     field, so a CPU cross-check that runs the ray out to rFar compares a different point
+     entirely.  Exporting the end state lets the page integrate the SAME geodesic to the SAME
+     place -- the disk's absorption model never has to be reproduced. */
+  evpaEnd = vec4(r, th, pr, pth);
+  evpaPhys = vec4(chiPhys, rCross, crossFound, 0.0);   /* x = physical screen EVPA at the first equatorial crossing, z = validity */
+  {
+    /* Bin centres: E/E0 = 0.5, 0.7, 0.9, 1.1, 1.3, 1.5 for the six bins of width 0.2 that
+       span [0.4, 1.6].  The first version multiplied the weights by 0.08*(0.5 + i), which
+       is not a mean of anything: it collapsed to a tiny constant, every pixel saturated to
+       x = -1 and the whole map came out uniformly red with no approaching/receding split.
+       Caught by looking at the render and cross-checking against the g-field view. */
+    float w0 = lb0, w1 = lb1, w2 = lb2, w3 = lb3, w4 = lb4, w5 = lb5;
+    float W = w0 + w1 + w2 + w3 + w4 + w5;
+    if (W > 0.0) {
+      float E0 = 0.5, E1 = 0.7, E2 = 0.9, E3 = 1.1, E4 = 1.3, E5 = 1.5;
+      float m1 = w0*E0 + w1*E1 + w2*E2 + w3*E3 + w4*E4 + w5*E5;
+      float m2 = w0*E0*E0 + w1*E1*E1 + w2*E2*E2 + w3*E3*E3 + w4*E4*E4 + w5*E5*E5;
+      float mu = m1 / W, var = max(m2 / W - mu * mu, 0.0);
+      lineInfo = vec4(mu, sqrt(var), W, 1.0);
+    }
+  }
+  escapedOut = endCode / 5.0;   /* debug 10: 0 exhausted .2 escaped .4 captured .6 ring .8 interior 1 transition */
+}
+
+
+/* ---- POLARISATION ---------------------------------------------------------
+   The magnetic field is a PRESCRIBED analytic model, not GRMHD: this renderer has no
+   dynamo, no Maxwell stress and no units, so the field is a modelling choice and is
+   labelled as such in the view names.  Within that model the quantities below are exact:
+     * the pitch factor sin(alpha) between B and the photon direction,
+     * the power-law synchrotron scalings jI ~ n Bperp^((p+1)/2) nu^-((p-1)/2) and
+       rho_V ~ n B_parallel / nu^2  (p and nu are constants here, so they collapse),
+     * Faraday DEPOLARISATION, which needs the complex amplitude accumulated along the
+       line of sight: P_obs = Int dP(s) exp(2 i psi_F(s)), |P_obs| <= Int |dP|.
+   The parallel transport of the polarisation angle is NOT applied in this shader pass; it
+   is integrated in js/polar.js on the CPU and validated there (|f|^2 and f.p conserved to
+   1e-12, metric compatibility 7e-15).  Saying so is the point: an un-transported angle map
+   would look plausible and be wrong. */
+/* ---- presentation helpers for the band / special views ------------------- */
+float luma3(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+/* EHT-style false colour on a LOGARITHMIC intensity stretch: the convention the Event
+   Horizon Telescope images use (black -> red -> yellow -> white on log I). */
+vec3 ehtRamp(float t){
+  t = clamp(t, 0.0, 1.0);
+  return vec3(smoothstep(0.30, 1.0, t), smoothstep(0.58, 1.0, t), smoothstep(0.84, 1.0, t));
+}
+/* signed map for a shift: BLUE = blueshift (g > 1), RED = redshift (g < 1).
+   The first version had these two the wrong way round -- the code painted negative x blue
+   while the comment and the label said blue meant blueshift, so the whole field came out
+   the wrong colour.  Caught by looking at the render, not by a test. */
+vec3 diverge(float x){
+  x = clamp(x * 3.0, -1.0, 1.0);
+  return x >= 0.0 ? vec3(0.12*(1.0 - x), 0.12*(1.0 - x), 0.12 + 0.88*x)   /* blueshift */
+                  : vec3(0.12 - 0.88*x, 0.12*(1.0 + x), 0.12*(1.0 + x));  /* redshift  */
+}
+
+void main(){
+  vec2 uv  = gl_FragCoord.xy / uResolution;
+  vec2 ndc = uv * 2.0 - 1.0;
+
+  /* ---- camera state straight out of BUFFER B's bottom-right pixels ---- */
+  vec4 s0 = texture2D(uStateTex, uStateUV0);
+  vec4 s1 = texture2D(uStateTex, uStateUV0 + uStateUVStep);
+  vec4 s2 = texture2D(uStateTex, uStateUV0 + 2.0 * uStateUVStep);
+  vec4 s3 = texture2D(uStateTex, uStateUV0 + 3.0 * uStateUVStep);
+  bool valid = (s3.x > 0.5) && (abs(s0.x) < 1.0e5) && (s1.w > 0.0) && (s1.w < 10.0)
+               && (abs(s0.y) < 3.2) && (s2.w > 0.0 || s2.w < 0.0);
+  vec4 c0 = (valid && uForceState < 0.5) ? s0 : uBackA;
+  vec4 c1 = (valid && uForceState < 0.5) ? s1 : uBackB;
+  vec4 c2 = (valid && uForceState < 0.5) ? s2 : uBackC;
+
+  float r0 = c0.x, th0 = c0.y, ph0 = c0.z;
+  vec4  q  = normalize(c2);
+
+  vec3 dirCam = normalize(vec3(ndc.x * uAspect * uTanHalfFov, ndc.y * uTanHalfFov, -1.0));
+  vec3 nw     = qrot(q, dirCam);
+
+  float s = sin(th0), c = cos(th0);
+  vec3 rh  = vec3(s * cos(ph0), s * sin(ph0), c);
+  vec3 thh = vec3(c * cos(ph0), c * sin(ph0), -s);
+  vec3 phh = vec3(-sin(ph0), cos(ph0), 0.0);
+  vec3 nloc = vec3(dot(nw, rh), dot(nw, thh), dot(nw, phh));
+  nloc = normalize(nloc + vec3(1e-8));
+
+  vec3 col; float rEnd; vec4 dbg; float escFlag;
+  vec4 bandInfo; vec4 lineInfo; vec4 polInfo; vec4 transportInfo; vec4 evpaDbg; vec4 evpaEnd; vec4 evpaPhys;
+  knTrace(r0, th0, ph0, nloc, uSeed, col, rEnd, dbg, escFlag, bandInfo, lineInfo, polInfo, transportInfo, evpaDbg, evpaEnd, evpaPhys);
+
+  /* ---- THE SHADER'S OWN END STATE, for the CPU EVPA cross-check ----------------------
+     The trace ends at the DISK (trans < 4e-3), so the page must integrate the same geodesic
+     to the same point.  View 33 carries r in TWO bytes -- the coarse byte is r/64 and the fine
+     byte is the residual inside one coarse quantum, i.e. 16 bits together, 0.001 in r at the
+     disk -- because one byte alone is a 0.25 quantum and the transport error from a 0.25
+     position error is of the same order as the quantity being tested.  View 34 carries
+     theta - pi/2 on +-0.4 and p^r on +-4, view 35 carries p^theta.  Red's 0.25 in every
+     branch certifies the readback before the value is believed. */
+  /* 16-BIT READOUTS (views 33, 36-39).  One byte is a 0.25 quantum on r and a 0.0157 quantum on
+     p^r, and a position error of that size along the ray is the same order as the EVPA being
+     tested -- so the exported initial data could not reproduce the shader's geodesic and every
+     comparison would have carried a phantom offset.  The split is EXACT: the coarse byte is
+     floor(U*255) and the fine byte is fract(U*255), so U = x + y/255 recovers U with no
+     double-counting.  (An earlier version used clamp(U) for the coarse byte; that rounds to
+     NEAREST while the fine byte carries the residual of the TRUE U, so U = 0.5 came back as
+     0.504 -- a half-quantum error built into the codec.)  floor() is an exact integer in fp16,
+     so the coarse byte survives the render target exactly.  Red is the 0.25 certificate. */
+  if (uDebug == 33) {
+    float R = evpaEnd.x / 64.0;                 /* r at the end, 0..64 */
+    float Q = floor(R * 255.0);
+    col = vec3(Q / 255.0, R * 255.0 - Q, 0.25);
+  } else if (uDebug == 36) {
+    float U = (evpaDbg.x + 4.0) / 8.0;          /* initial p^r, -4..4 */
+    float Q = floor(U * 255.0);
+    col = vec3(Q / 255.0, U * 255.0 - Q, 0.25);
+  } else if (uDebug == 37) {
+    float U = (evpaDbg.y + 8.0) / 16.0;         /* initial p^theta, -8..8.  The +-2 range clipped it at BOTH
+                                                   test pixels (the coarse channel read 0), and the CPU then
+                                                   integrated a DIFFERENT geodesic -- caught by theta off by
+                                                   0.26 rad, not by looking at the value. */
+    float Q = floor(U * 255.0);
+    col = vec3(Q / 255.0, U * 255.0 - Q, 0.25);
+  } else if (uDebug == 38) {
+    float U = evpaDbg.z / 4.0;                  /* E, 0..4 */
+    float Q = floor(U * 255.0);
+    col = vec3(Q / 255.0, U * 255.0 - Q, 0.25);
+  } else if (uDebug == 45) {
+    /* THE PHYSICAL EVPA ON 16 BITS.  The paper's spin-induced rotation at r_s ~ 17 is 2a/r_s^2 =
+       0.006 rad, which is HALF of view 41's 8-bit quantum (pi/255 = 0.0123) -- unresolvable there
+       and the reason (D)'s magnitude comparison could not be attempted.  Split with floor() so the
+       pair is exactly invertible: chi = pi * (x/255 + y/65025 - 0.5), quantum 4.8e-5 rad. */
+    float U = clamp(evpaPhys.x / 3.14159265 + 0.5, 0.0, 1.0);
+    float Q = floor(U * 255.0);
+    col = vec3(Q / 255.0, U * 255.0 - Q, 0.25);
+  } else if (uDebug == 43) {
+    /* THE DIRECTION OF +alpha-hat, in the observer's own orthonormal frame (e_a, e_b), as a unit
+       vector: x,y = 0.5 +- 0.5 * component, so the vector is read directly and the ROTATION from
+       e_a to alpha-hat is atan2(y, x).  Red 0.25 certifies the readback. */
+    vec4 G = knGellesGrad(nloc, r0, th0, 1.0e-4);
+    float mx = max(length(G.xy), 1e-12);
+    col = vec3(clamp(0.5 + 0.5 * G.x / mx, 0.0, 1.0), clamp(0.5 + 0.5 * G.y / mx, 0.0, 1.0), 0.25);
+  } else if (uDebug == 44) {
+    /* THE DIRECTION OF +beta-hat, same frame.  If this is not perpendicular to view 43's vector then
+       the (alpha, beta) chart is not conformal on this sky, which is a statement about my finite
+       observer radius and can only be made with a REAL angle -- see the note on knGellesGrad. */
+    vec4 G = knGellesGrad(nloc, r0, th0, 1.0e-4);
+    float mx = max(length(G.zw), 1e-12);
+    col = vec3(clamp(0.5 + 0.5 * G.z / mx, 0.0, 1.0), clamp(0.5 + 0.5 * G.w / mx, 0.0, 1.0), 0.25);
+  } else if (uDebug == 42) {
+    /* VALIDITY OF THE PHYSICAL EVPA.  Red 0.25 certifies the readback; GREEN is 1.0 when the ray
+       has an equatorial crossing and 0.0 when it has none, so a legitimate chi = 0 can never be
+       confused with 'the crossing was never reached'.  Blue is the crossing radius on 0..64. */
+    col = vec3(0.25, evpaPhys.z, clamp(evpaPhys.y / 64.0, 0.0, 1.0));
+  } else if (uDebug == 41) {
+    /* THE PHYSICAL SCREEN EVPA at the first equatorial crossing, with the source taken from the
+       MAGNETIC FIELD.  Red 0.25 certifies the readback.  Blue carries the crossing radius on
+       0..64 as a check only -- the CPU locates the crossing itself by root-finding cos theta = 0. */
+    col = vec3(clamp(0.5 + evpaPhys.x / 3.14159265, 0.0, 1.0), 0.25, clamp(evpaPhys.y / 64.0, 0.0, 1.0));
+  } else if (uDebug == 40) {
+    /* THE OBSERVER'S LOCAL DIRECTION COMPONENTS (nloc = (n_r, n_theta, n_phi) in the local
+       ORTHONORMAL frame).  Needed to place Gelles 2021's screen axes: they define
+       alpha = -lambda / sin(theta_o) and beta = +-o sqrt(Theta), so +alpha-hat is the direction
+       of DECREASING L and +beta-hat the sign of p^theta at the observer.  Both are properties of
+       the observer's own sky basis, so the comparison must be made against the local
+       orthonormal directions, MEASURED here, not hand-derived from my camera rig. */
+    col = vec3(clamp(0.5 + 0.5 * nloc.z, 0.0, 1.0), clamp(0.5 + 0.5 * nloc.y, 0.0, 1.0), 0.25);
+  } else if (uDebug == 39) {
+    float U = (evpaDbg.w + 32.0) / 64.0;        /* L, -32..32 */
+    float Q = floor(U * 255.0);
+    col = vec3(Q / 255.0, U * 255.0 - Q, 0.25);
+  } else if (uDebug == 34) {
+    col = vec3(clamp(0.5 + (evpaEnd.y - 1.5707963) / 0.8, 0.0, 1.0), clamp(0.5 + evpaEnd.z / 8.0, 0.0, 1.0), 0.25);
+  } else if (uDebug == 35) {
+    col = vec3(clamp(0.5 + evpaEnd.w / 32.0, 0.0, 1.0), 0.25, 0.25);
+  } else if (uDebug == 30) {
+    col = vec3(0.25, clamp(0.5 + evpaDbg.x * 0.25, 0.0, 1.0), clamp(0.5 + evpaDbg.y * 0.25, 0.0, 1.0));   /* prInit, pthInit on +-2 */
+
+  } else if (uDebug == 32) {
+    col = vec3(0.25, clamp(evpaDbg.z / 4.0, 0.0, 1.0), clamp(0.5 + evpaDbg.w / 24.0, 0.0, 1.0));   /* E (0..4), L (-12..+12) */
+
+  } else if (uDebug == 31) {
+    mat4 gY, gYr, gYt, gYu; knMetricDR(6.0, 1.2, gY, gYr, gYt, gYu);
+    vec4 pCovY = vec4(-1.0, 0.3, 0.2, 3.0);
+    vec4 bR = gY * vec4(0.0, 1.0, 0.0, 0.0);      /* b = d_r: exercises the four terms that vanish for b = d_phi */
+    vec4 fY = knPolFromB(pCovY, bR, 6.0, 1.2);
+    col = vec3(0.25, clamp(0.5 + fY.y * 3.0, 0.0, 1.0), clamp(0.5 + fY.w * 3.0, 0.0, 1.0));
+  } else if (uDebug == 130) {
+    float cosG = evpaDbg.z * evpaDbg.w > 0.0 ? evpaDbg.y / sqrt(max(evpaDbg.z * evpaDbg.w, 1e-20)) : 0.0;
+    col = vec3(0.25, clamp((log(max(abs(evpaDbg.y), 1e-6)) + 6.0) / 12.0, 0.0, 1.0), clamp(0.5 + 0.5 * cosG, 0.0, 1.0));
+  } else if (uDebug == 29) {
+    float fpX;
+    mat4 gX, gXr, gXt, gXu; knMetricDR(6.0, 1.2, gX, gXr, gXt, gXu);
+    vec4 pCovX = vec4(-1.0, 0.3, 0.2, 3.0);
+    vec4 bPhi = gX * vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 fX = knPolFromB(pCovX, bPhi, 6.0, 1.2);
+    col = vec3(0.25, clamp(0.5 + fX.y * 3.0, 0.0, 1.0), clamp(0.5 + fX.z * 3.0, 0.0, 1.0));
+  } else if (uDebug == 28) {
+    /* THE METRIC ITSELF, which knF2 uses and which has never been checked directly. */
+    mat4 gM, gMr, gMt, gMu; knMetricDR(6.0, 1.2, gM, gMr, gMt, gMu);
+    /* ONE STEP of the shader's own knTransportStep, component 2, on a scale of 2 per unit;
+       the library's value for the same state and ds is computed in the page. */
+    mat4 gT2, gT2r, gT2t, gT2u; knMetricDR(6.0, 1.2, gT2, gT2r, gT2t, gT2u);
+    vec4 pC2 = vec4(-1.0, 0.3, 0.2, 3.0);
+    vec4 fC2 = vec4(0.0, 0.0, 1.0 / max(sqrt(max(gT2[2][2], 1e-12)), 1e-9), 0.0);
+    vec4 fStep2 = knTransportStep(6.0, 1.2, gT2u * pC2, fC2, 0.05);
+    col = vec3(0.25, clamp(0.5 + fStep2.z * 2.0, 0.0, 1.0), clamp(0.5 + fStep2.y * 2.0, 0.0, 1.0));
+
+  } else if (uDebug == 27) {
+    float chi = transportInfo.x;   /* screen EVPA in radians, folded to +-pi/2 */
+    col = vec3(0.5 + chi / 3.14159265, clamp((log(max(abs(evpaDbg.x), 1e-8)) + 18.420681) / 18.420681, 0.0, 1.0), 0.5);   /* Gram residual, 1e-8..1, natural log */
+
+  } else if (uDebug == 26) {
+    /* THE PHYSICAL POLARISATION from the epsilon construction (closed form): its two
+       invariants must be f.p = 0 and |f|^2 = 1.  Red carries the constant 0.25 so the
+       readback is certified; green is f.p and blue is |f|^2 - 1, both centred on 127. */
+    mat4 gW, gWr, gWt, gWu; knMetricDR(6.0, 1.2, gW, gWr, gWt, gWu);
+    vec4 pCovW = vec4(-1.0, 0.3, 0.2, 3.0);
+    float fpW;
+    vec4 fW = knPolToroidal(pCovW, 6.0, 1.2, fpW);
+    float fpTrue = dot(fW, pCovW);   /* f^mu p_mu: plain contraction, no metric */
+    float nW = dot(fW, gW * fW);
+    col = vec3(0.25, clamp((log(max(abs(fpTrue), 1e-6)) + 6.0) / 12.0, 0.0, 1.0), clamp(0.5 + (nW - 1.0) * 10.0, 0.0, 1.0));
+  } else if (uDebug == 25) {
+    float rC  = 2.0 + 18.0 * gl_FragCoord.x / 1280.0;
+    float thC = 0.15 + 2.90 * gl_FragCoord.y / 720.0;
+    col = vec3(0.25, clamp((rC - 2.0) / 18.0, 0.0, 1.0), clamp((thC - 0.15) / 2.90, 0.0, 1.0));
+
+  } else if (uDebug == 23) {
+    /* SHADER ASSERTION 1, as a NUMBER rather than a colour.  The colour version could only say
+       pass/fail and its swatch was altered by the tonemapping path, so it proved unusable; here
+       the deviation |f|^2 - 1 is emitted directly, scaled by 1000, and the test reads the pixel
+       back and divides.  0 = the invariant holds. */
+    mat4 gQ, gQr, gQt, gQu; knMetricDR(6.0, 1.2, gQ, gQr, gQt, gQu);
+vec4 pCovQ = vec4(-1.0, 0.3, 0.2, 3.0);
+vec4 pConQ = gQu * pCovQ;
+vec4 fProbeQ = vec4(0.0, 0.0, 1.0 / max(sqrt(max(gQ[2][2], 1e-12)), 1e-9), 0.0);
+col = vec3(clamp(0.5 + (transportInfo.y - 1.0) * 50.0, 0.0, 1.0), clamp(transportInfo.w / 1024.0, 0.0, 1.0), 0.5);   /* |f|^2 - 1 on +-0.01, centre 127 */
+  } else if (uDebug == 24) {
+    /* SHADER ASSERTION 2 as a number: |f.p - f.p(initial)|, scaled by 1000. */
+    /* NUMERIC PROBE (view 24): the shader's OWN -Gamma p f at a fixed, NON-degenerate state,
+   with the calibration constants 0.25 and 0.75 in red and blue so the readback can be
+   certified before any comparison is believed. */
+mat4 gV, gVr, gVt, gVu; knMetricDR(6.0, 1.2, gV, gVr, gVt, gVu);
+vec4 pCovV = vec4(-1.0, 0.3, 0.2, 3.0);
+vec4 fProbeV = vec4(0.0, 0.0, 1.0 / max(sqrt(max(gV[2][2], 1e-12)), 1e-9), 0.0);
+vec4 rhsV = knTransportRhs(6.0, 1.2, gVu * pCovV, fProbeV);
+col = vec3(0.25, clamp(0.5 + rhsV.x * 500.0, 0.0, 1.0), 0.75);
+  } else if (uDebug == 21) {
+    /* OBSERVED POLARISATION FRACTION with Faraday depolarisation along the line of sight:
+       |P_obs| / sum|dP|.  Green = little depolarisation, red = heavily depolarised.
+       The PARALLEL TRANSPORT of the angle is not applied in this pass -- it is integrated
+       and validated on the CPU in js/polar.js.  Saying so is the point: an un-transported
+       angle map would look plausible and be wrong. */
+    float frac = polInfo.y > 1e-9 ? clamp(polInfo.x / polInfo.y, 0.0, 1.0) : 0.0;
+    col = polInfo.y > 1e-9 ? mix(vec3(0.85, 0.15, 0.10), vec3(0.15, 0.95, 0.35), frac) : vec3(0.0);
+  } else if (uDebug == 22) {
+    /* FARADAY DEPTH theta_F = Int rho_V ds along the ray, signed: blue = negative, red = positive */
+    col = diverge(polInfo.z * 4.0);
+  } else if (uDebug == 1){
+    col = heat(dbg.x);
+  } else if (uDebug == 2){
+    float e = max(dbg.y, 1e-12);
+    float lg = (log(e) - log(1e-8)) / (log(1.0) - log(1e-8));
+    col = heat(clamp(lg, 0.0, 1.0));
+  } else if (uDebug == 3){
+    col = heat(float(dbg.z) / 3.0);
+  } else if (uDebug == 4){
+    col = heat(clamp(dbg.w / max(uM * 3.0, 1e-3), 0.0, 1.0));
+  } else if (uDebug == 5){
+    col = (rEnd < 0.0) ? vec3(0.16, 0.95, 0.30) : vec3(0.95, 0.14, 0.12);
+  } else if (uDebug == 10){
+    /* geometry-only channel, not reachable from the keyboard: pure white where
+       the ray escaped, pure black where it was captured.  Gives the audit a
+       sub-pixel-accurate critical curve that no disk emission can contaminate. */
+    col = vec3(escFlag);
+  } else if (uDebug == 11) {
+    /* X-RAY 2-10 keV (disk + corona proxy).  A HARD band is weighted towards the
+       hottest gas, so the view is weighted by the local temperature and shown on a
+       log stretch.  No Comptonisation or corona geometry is modelled here -- the
+       corona is what IXPE actually maps, so this is a PROXY, not that measurement. */
+    float w = smoothstep(2.0e4, 4.0e5, max(bandInfo.x, 1.0));
+    col = heat(clamp(log(1.0 + luma3(col) * 900.0) / 7.0, 0.0, 1.0)) * (0.30 + 0.70 * w);
+  } else if (uDebug == 12) {
+    /* RADIO 230 GHz, EHT presentation: the total intensity on a LOGARITHMIC stretch
+       with the black->red->yellow->white ramp the EHT images use.  The geometry shown
+       is genuine (it is the same lensed transport); the BAND WEIGHTING is a proxy,
+       because this renderer has no magnetic field and therefore no synchrotron. */
+    col = ehtRamp(clamp(log(1.0 + luma3(col) * 2.0e3) / 8.0, 0.0, 1.0));
+  } else if (uDebug == 13) {
+    /* NEAR-INFRARED, K band 2.2 um (the GRAVITY band): the Wien tail, so the view is
+       brightest where the gas is hottest.  GRAVITY itself is an interferometer and
+       does not make images; VLT/Keck NIR frames use a heat palette, which is what is
+       reproduced here. */
+    float w = clamp(max(bandInfo.x, 1.0) / 2.0e4, 0.15, 1.0);
+    col = heat(clamp(log(1.0 + luma3(col) * 300.0) / 6.5, 0.0, 1.0)) * w;
+  } else if (uDebug == 14) {
+    /* BROAD IRON K-alpha 6.4 keV: the observable is the LINE CENTROID, which the
+       gravity and the orbital motion shift by g - 1.  Blue = approaching gas
+       (blueshifted line), red = receding.  This is the classic spin diagnostic. */
+    /* FLUX-WEIGHTED centroid of the accumulated line profile (was the g of the first
+       crossing only).  lineInfo = (centroid E/E0, second moment, total flux, valid). */
+    float s = lineInfo.w > 0.5 ? (lineInfo.x - 1.0) : 0.0;
+    col = diverge(s) * clamp(log(1.0 + lineInfo.z * 120.0) / 5.5, 0.04, 1.0);
+  } else if (uDebug == 15) {
+    /* HIGHER-ORDER IMAGES: colour by how many times the ray crossed the equatorial
+       plane, i.e. which order n of the lensed image it belongs to.  The n >= 2 rings
+       are the photon-ring substructure current papers are after. */
+    float n = dbg.z;   /* equatorial crossings; bandInfo.w now carries |b| = |L/E| */
+    col = n < 0.5 ? vec3(0.20, 0.55, 0.95)
+        : (n < 1.5 ? vec3(0.95, 0.85, 0.25)
+        : (n < 2.5 ? vec3(0.95, 0.45, 0.15) : vec3(0.95, 0.15, 0.35)));
+  } else if (uDebug == 16) {
+    /* SHIFT FIELD: the total gravitational + Doppler factor g, signed.  Real images
+       cannot show this directly, which is why every movie renders it in false colour. */
+    col = diverge(bandInfo.y - 1.0);
+  } else if (uDebug == 17) {
+    /* LOG-INTENSITY FALSE COLOUR over ALL bands (the EHT house style applied to the
+       bolometric image): what the same data looks like when the dynamic range is
+       compressed logarithmically instead of tonemapped. */
+    col = ehtRamp(clamp(log(1.0 + luma3(col) * 1.5e3) / 8.0, 0.0, 1.0));
+  } else if (uDebug == 18) {
+    /* TERMINATION + REGIME MAP: what happened to each ray, and which sheet of the
+       extended spacetime it ended on.  This is where a naked singularity differs. */
+    float e = escFlag * 5.0;
+    col = e < 0.5 ? vec3(0.26, 0.26, 0.30)
+        : (e < 1.5 ? vec3(0.04, 0.04, 0.09)
+        : (e < 2.5 ? vec3(0.95, 0.20, 0.20)
+        : (e < 3.5 ? vec3(0.95, 0.60, 0.10)
+        : (e < 4.5 ? vec3(0.20, 0.90, 0.40) : vec3(0.10, 0.30, 0.85)))));
+    if (rEnd < 0.0) col = mix(col, vec3(0.85, 0.30, 0.95), 0.55);   /* r < 0 sheet */
+  } else if (uDebug == 19) {
+    /* LINE WIDTH: the second moment of the accumulated profile, i.e. how broad the iron line
+       is at that pixel.  Broad = deep in the potential well / fast orbital motion. */
+    col = lineInfo.w > 0.5 ? heat(clamp(lineInfo.y / 0.55, 0.0, 1.0)) : vec3(0.0);
+  } else if (uDebug == 20) {
+    /* GEOMETRY VIEW: capture / escape / exhaustion only -- no disk emission, no sky -- with
+       the critical curve drawn on top.  This is the view in which "a horizon has a shadow,
+       a naked singularity has none" is directly visible. */
+    float e = escFlag * 5.0;
+    col = e < 0.5 ? vec3(0.30, 0.06, 0.06)
+        : (e < 1.5 ? vec3(0.04, 0.04, 0.09)
+        : (e < 2.5 ? vec3(0.95, 0.20, 0.20)
+        : (e < 3.5 ? vec3(0.95, 0.60, 0.10) : vec3(0.10, 0.30, 0.85))));
+    if (rEnd < 0.0) col = mix(col, vec3(0.85, 0.30, 0.95), 0.55);
+  }
+  /* critical-curve overlay for the diagnostic views that are about geometry */
+  if (uDebug == 15 || uDebug == 18 || uDebug == 20) {
+    float bc = bandInfo.w;
+    bool on = false;
+    if (uBCritPro > 1e-3) on = on || abs(bc - uBCritPro) / uBCritPro < 0.006;
+    if (uBCritRet > 1e-3) on = on || abs(bc - uBCritRet) / uBCritRet < 0.006;
+    if (on) col = mix(col, vec3(1.0), 0.85);
+  }
+
+  /* FIX FOR A REAL MISLEADING ARTEFACT: a ray that merely ran out of its step budget was
+     shaded with whatever little colour it had accumulated, so it looked exactly like a
+     horizon shadow -- and in the naked cases exhaustion is the MOST prominent dark
+     feature, which is why the naked image did not look special.  It is now tinted. */
+  /* The first version tinted EVERY exhausted pixel dark red; at 2.2% of the frame, all of it
+     sitting in the dark region next to the shadow, that read as "the dark area is reddish"
+     -- ugly, and it also just traded one misleading look for another.  Now it is a sparse
+     stipple: one pixel in eight, at full strength.  The eye reads it as a texture instead of
+     a colour cast, and it can be switched off with U. */
+  if (uDebug == 0 && uMarkUnresolved > 0.5 && escFlag < 0.1) {
+    float dth = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    if (dth < 0.125) col = mix(col, vec3(0.62, 0.16, 0.12), 0.85);
+  }
+
+  /* NaN firewall: a sane pixel must be finite, otherwise emit black */
+  /* The probe views must survive the firewall above: the NaN guard tests the KNTRACE outputs,
+     and for these views those outputs are deliberately ignored, so a short probe ray whose
+     accumulators happen to be non-finite would black out an otherwise valid reading.  This is
+     why the probe read 0 for Sigma, Delta AND uM alike. */
+  if (uDebug == 125) {
+    float rH  = 2.0 + 18.0 * gl_FragCoord.x / 1280.0;
+    float thH = 0.15 + 2.90 * gl_FragCoord.y / 720.0;
+    mat4 gH, gHr, gHt, gHu; knMetricDR(rH, thH, gH, gHr, gHt, gHu);
+    vec4 pH = gHu * vec4(-1.0, 0.3, 0.2, 3.0);
+    vec4 fH = vec4(0.0, 0.0, 1.0 / max(sqrt(max(gH[2][2], 1e-12)), 1e-9), 0.0);
+    float qH = knTransportRhs(rH, thH, pH, fH).x;
+    col = vec3(0.25, clamp((log(max(abs(qH), 1e-12)) + 12.0) / 12.0, 0.0, 1.0), qH >= 0.0 ? 0.75 : 0.25);
+  }
+  if (!(col.r == col.r) || !(col.g == col.g) || !(col.b == col.b)) col = vec3(0.0);
+
+  gl_FragColor = vec4(col, 1.0);
+}

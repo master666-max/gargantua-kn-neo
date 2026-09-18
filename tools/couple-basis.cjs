@@ -1,0 +1,12 @@
+const fs = require('fs');
+const f = 'shaders/bufferA.frag';
+let T = fs.readFileSync(f, 'utf8');
+const a = "        vec4 F[4];\n        vec4 D[4];\n        F[0] = fPol;\n        for (int st = 0; st < 4; st++) {\n          if (st > 0) { F[st] = fPol + ((st == 3) ? h : 0.5 * h) * D[st-1]; }\n          mat4 gm, gmr, gmt, gmu; knMetricDR(ys[st].x, ys[st].y, gm, gmr, gmt, gmu);\n          vec4 pc = vec4(-E, ys[st].z, ys[st].w, L);\n          D[st] = knTransportRhs(ys[st].x, ys[st].y, gmu * pc, F[st]);\n        }\n        fPol = fPol + (h / 6.0) * (D[0] + 2.0 * D[1] + 2.0 * D[2] + D[3]);";
+const b = "        /* ALL THREE vectors share the geodesic's stages: fPol (the polarisation) and gA, gB (the\n           observer's screen basis).  Leaving gA and gB to the frozen block -- whose step is now\n           zero -- froze them at the camera while f travelled the ray, which is why the Gram\n           reconstruction failed by 1.5 % to 45 % (6l). */\n        vec4 Ff[4], Fa[4], Fb[4];\n        vec4 Df[4], Da[4], Db[4];\n        Ff[0] = fPol; Fa[0] = gA; Fb[0] = gB;\n        for (int st = 0; st < 4; st++) {\n          float w = (st == 3) ? h : 0.5 * h;\n          if (st > 0) {\n            Ff[st] = fPol + w * Df[st-1];\n            Fa[st] = gA   + w * Da[st-1];\n            Fb[st] = gB   + w * Db[st-1];\n          }\n          mat4 gm, gmr, gmt, gmu; knMetricDR(ys[st].x, ys[st].y, gm, gmr, gmt, gmu);\n          vec4 ps = gmu * vec4(-E, ys[st].z, ys[st].w, L);\n          Df[st] = knTransportRhs(ys[st].x, ys[st].y, ps, Ff[st]);\n          Da[st] = knTransportRhs(ys[st].x, ys[st].y, ps, Fa[st]);\n          Db[st] = knTransportRhs(ys[st].x, ys[st].y, ps, Fb[st]);\n        }\n        fPol = fPol + (h / 6.0) * (Df[0] + 2.0 * Df[1] + 2.0 * Df[2] + Df[3]);\n        gA   = gA   + (h / 6.0) * (Da[0] + 2.0 * Da[1] + 2.0 * Da[2] + Da[3]);\n        gB   = gB   + (h / 6.0) * (Db[0] + 2.0 * Db[1] + 2.0 * Db[2] + Db[3]);";
+const n = T.split(a).length - 1;
+if (n !== 1) { console.log('ABORT: coupled block found ' + n); process.exit(1); }
+T = T.split(a).join(b);
+const o = (T.match(/{/g)||[]).length, c = (T.match(/}/g)||[]).length;
+console.log('balance', o === c, o, c);
+if (o !== c) { console.log('ABORT unbalanced'); process.exit(1); }
+fs.writeFileSync(f, T); console.log('WROTE');

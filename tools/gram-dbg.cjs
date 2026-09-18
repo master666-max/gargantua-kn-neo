@@ -1,0 +1,15 @@
+const fs = require('fs');
+const f = 'shaders/bufferA.frag';
+let T = fs.readFileSync(f, 'utf8');
+const bal = (s) => { const o=(s.match(/{/g)||[]).length, c=(s.match(/}/g)||[]).length, p=(s.match(/\(/g)||[]).length, q=(s.match(/\)/g)||[]).length; return {ok:o===c&&p===q}; };
+const must = (c,m) => { if(!c){console.log('ABORT: '+m);process.exit(1);} };
+const rep = (a, b, tag) => { const n = T.split(a).length - 1; must(n === 1, tag + ': found ' + n); T = T.split(a).join(b); console.log('ok: ' + tag); };
+rep('out vec4 polInfo, out vec4 transportInfo)', 'out vec4 polInfo, out vec4 transportInfo, out vec4 evpaDbg)', 'signature');
+rep('vec4 bandInfo; vec4 lineInfo; vec4 polInfo; vec4 transportInfo;', 'vec4 bandInfo; vec4 lineInfo; vec4 polInfo; vec4 transportInfo; vec4 evpaDbg;', 'decl');
+rep('bandInfo, lineInfo, polInfo, transportInfo);', 'bandInfo, lineInfo, polInfo, transportInfo, evpaDbg);', 'call');
+rep('  transportInfo = vec4(chiEVPA, fPolNlast, evpaResid, nUpd);', '  transportInfo = vec4(chiEVPA, fPolNlast, evpaResid, nUpd);\n  evpaDbg = vec4(chiEVPA, detG, G11, G22);   /* Gram conditioning, for the residual diagnosis */', 'dbg');
+rep('  if (uDebug == 29) {', '  if (uDebug == 30) {\n    float cosG = evpaDbg.z * evpaDbg.w > 0.0 ? evpaDbg.y / sqrt(max(evpaDbg.z * evpaDbg.w, 1e-20)) : 0.0;\n    col = vec3(0.25, clamp((log(max(abs(evpaDbg.y), 1e-6)) + 6.0) / 12.0, 0.0, 1.0), clamp(0.5 + 0.5 * cosG, 0.0, 1.0));\n  } else if (uDebug == 29) {', 'view 30');
+const b = bal(T); console.log('balance', JSON.stringify(b));
+must(b.ok, 'unbalanced');
+must(T.indexOf('out vec4 polInfo, out vec4 transportInfo, out vec4 evpaDbg)') > 0, 'signature edit missing');
+fs.writeFileSync(f, T); console.log('WROTE');
